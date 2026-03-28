@@ -1,0 +1,61 @@
+[
+  {
+    "name": "calculator",
+    "description": "Evaluate a mathematical expression",
+    "parameters": {
+      "expression": { "type": "string", "description": "Math expression to evaluate, e.g. '2 + 3 * 4'" }
+    }
+  },
+  {
+    "name": "web_search",
+    "description": "Search the web for current information",
+    "parameters": {
+      "query": { "type": "string", "description": "Search query" }
+    }
+  },
+  {
+    "name": "get_current_date",
+    "description": "Get today's date and time",
+    "parameters": {}
+  },
+  {
+    "name": "get_weather",
+    "description": "Get current weather for a location",
+    "parameters": {
+      "location": { "type": "string", "description": "City name or location" }
+    }
+  },
+  {
+    "name": "unit_converter",
+    "description": "Convert between units of measurement",
+    "parameters": {
+      "value": { "type": "number", "description": "The numeric value to convert" },
+      "from_unit": { "type": "string", "description": "Source unit, e.g. 'miles'" },
+      "to_unit": { "type": "string", "description": "Target unit, e.g. 'kilometers'" }
+    }
+  },
+  {
+    "name": "define_word",
+    "description": "Look up the definition of a word",
+    "parameters": {
+      "word": { "type": "string", "description": "The word to define" }
+    }
+  },
+  {
+    "name": "translate",
+    "description": "Translate text between languages",
+    "parameters": {
+      "text": { "type": "string", "description": "Text to translate" },
+      "from_lang": { "type": "string", "description": "Source language, e.g. 'English'" },
+      "to_lang": { "type": "string", "description": "Target language, e.g. 'Spanish'" }
+    }
+  },
+  {
+    "name": "set_timer",
+    "description": "Set a countdown timer",
+    "parameters": {
+      "duration_seconds": { "type": "integer", "description": "Timer duration in seconds" },
+      "label": { "type": "string", "description": "Label for the timer" }
+    }
+  }
+]

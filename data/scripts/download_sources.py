@@ -9,12 +9,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import bz2
 import json
 import logging
 import re
-import subprocess
-import sys
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import httpx
@@ -44,6 +44,11 @@ def wiki_to_plaintext(wikitext: str) -> str:
   text = re.sub(r"\[\[(?:Category|File|Image):[^\]]*\]\]", "", text, flags=re.IGNORECASE)
   text = re.sub(r"\{\{[^}]*\}\}", "", text)
   text = re.sub(r"<[^>]+>", "", text)
+  text = re.sub(
+    r"\b(?:thumb|right|left|center|upright|border|frameless|frame|alt=)\|",
+    "",
+    text,
+  )
   text = re.sub(r"[ \t]+", " ", text)
   text = re.sub(r"\n{3,}", "\n\n", text)
 
@@ -119,48 +124,59 @@ def chunk_article(text: str, title: str, page_id: str, source: str) -> list[dict
   return chunks
 
 
-def _iter_extracted_articles(extracted_dir: Path):
-  """Yield (id, title, text) from wikiextractor JSON output files."""
-  for subdir in sorted(extracted_dir.iterdir()):
-    if not subdir.is_dir():
-      continue
+def _iter_mediawiki_dump(dump_path: Path):
+  """Stream-parse a bz2-compressed MediaWiki XML dump, yielding (page_id, title, wikitext)."""
+  ns_uri = ""
 
-    for file_path in sorted(subdir.iterdir()):
-      with open(file_path, encoding="utf-8") as file:
-        for line in file:
-          line = line.strip()
+  with bz2.open(dump_path, "rt", encoding="utf-8") as f:
+    for _event, elem in ET.iterparse(f, events=("end",)):
+      tag = elem.tag
 
-          if not line:
-            continue
+      if not ns_uri and tag.endswith("}page"):
+        ns_uri = tag.split("}")[0] + "}"
 
-          article = json.loads(line)
+      if tag != f"{ns_uri}page":
+        continue
 
-          yield article["id"], article["title"], article["text"]
+      ns_elem = elem.find(f"{ns_uri}ns")
+
+      if ns_elem is not None and ns_elem.text != "0":
+        elem.clear()
+        continue
+
+      title_elem = elem.find(f"{ns_uri}title")
+      id_elem = elem.find(f"{ns_uri}id")
+      text_elem = elem.find(f".//{ns_uri}text")
+
+      if title_elem is not None and id_elem is not None and text_elem is not None and text_elem.text:
+        yield id_elem.text, title_elem.text, text_elem.text
+
+      elem.clear()
 
 
 def process_simplewiki(*, resume: bool = False) -> Path:
-  """Download Simple English Wikipedia, extract with wikiextractor, and chunk into passage JSONL."""
+  """Download Simple English Wikipedia, parse the XML dump directly, and chunk into passage JSONL."""
   dump_path = DUMPS_DIR / "simplewiki-latest-pages-articles.xml.bz2"
   output_path = SOURCES_DIR / "simplewiki_passages.jsonl"
-  extracted_dir = DUMPS_DIR / "simplewiki_extracted"
 
   download_file(SIMPLEWIKI_URL, dump_path, resume=resume)
 
-  if not (resume and extracted_dir.exists() and any(extracted_dir.iterdir())):
-    log.info("Extracting with wikiextractor...")
+  if resume and output_path.exists() and output_path.stat().st_size > 0:
+    log.info("Already exists, skipping: %s", output_path.name)
+    return output_path
 
-    subprocess.run(
-      [sys.executable, "-m", "wikiextractor", str(dump_path), "-o", str(extracted_dir), "--json"],
-      check=True,
-    )
-
-  log.info("Processing Simple English Wikipedia...")
+  log.info("Parsing Simple English Wikipedia dump...")
 
   articles = 0
   passages = 0
 
   with open(output_path, "w", encoding="utf-8") as out:
-    for page_id, title, text in _iter_extracted_articles(extracted_dir):
+    for page_id, title, wikitext in _iter_mediawiki_dump(dump_path):
+      if should_skip(title, wikitext):
+        continue
+
+      text = wiki_to_plaintext(wikitext)
+
       if len(text.split()) < MIN_WORDS:
         continue
 

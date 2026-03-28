@@ -18,3 +18,4 @@ data/open_datasets/
 data/sources/
 data/synthetic/
 .cursor
+.env
