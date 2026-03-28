@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.ruff_cache/
+model/checkpoints/
+model/exports/
+browser/node_modules/
+browser/dist/
+browser/public/picorouter.onnx
+browser/public/picorouter.onnx.data
+browser/public/tokenizer.json
+.tsbuildinfo
+uv.lock
+playground/
+tasks/
