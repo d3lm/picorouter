@@ -1,3 +1,4 @@
+.DS_Store
 .venv/
 __pycache__/
 *.pyc
@@ -13,3 +14,7 @@ browser/public/tokenizer.json
 uv.lock
 playground/
 tasks/
+data/open_datasets/
+data/sources/
+data/synthetic/
+.cursor

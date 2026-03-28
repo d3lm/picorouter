@@ -18,6 +18,8 @@ dependencies = [
   "torch>=2.6",
   "numpy>=2.2",
   "mwparserfromhell>=0.7",
+  "wikiextractor>=3.0",
+  "nltk>=3.9",
   "datasketch>=1.6",
   "onnxscript>=0.6.2",
 ]

@@ -31,8 +31,10 @@ def collect_texts(data_path: Path) -> list[str]:
     for line in file:
       example = json.loads(line)
       texts.append(example["context"])
+
       for turn in example["conversation"]:
         texts.append(turn["content"])
+
       if example.get("tools"):
         texts.append(json.dumps(example["tools"]))
 
@@ -83,10 +85,11 @@ def encode_example(tokenizer: Tokenizer, example: dict) -> list[int]:
   ctx_id = get_special_token_id(tokenizer, "<|context|>")
   tools_id = get_special_token_id(tokenizer, "<|tools|>")
   user_id = get_special_token_id(tokenizer, "<|user|>")
-  asst_id = get_special_token_id(tokenizer, "<|assistant|>")
+  assistant_id = get_special_token_id(tokenizer, "<|assistant|>")
   eos_id = get_special_token_id(tokenizer, "<|eos|>")
 
   tokens = [ctx_id]
+
   tokens.extend(tokenizer.encode(example["context"]).ids)
   tokens.append(tools_id)
 
@@ -98,7 +101,7 @@ def encode_example(tokenizer: Tokenizer, example: dict) -> list[int]:
       tokens.append(user_id)
       tokens.extend(tokenizer.encode(turn["content"]).ids)
     elif turn["role"] == "assistant":
-      tokens.append(asst_id)
+      tokens.append(assistant_id)
       tokens.extend(tokenizer.encode(turn["content"]).ids)
 
   tokens.append(eos_id)
