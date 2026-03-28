@@ -34,7 +34,7 @@ uv run python -m data.scripts.download_sources --source simplewiki --resume
 
 Requires `ANTHROPIC_API_KEY` and/or `OPENAI_API_KEY` environment variables.
 
-**Tool-calling data** (~84K examples from ~12K passages):
+**Tool-calling data**:
 
 ```bash
 uv run python -m data.scripts.generate_synthetic \
@@ -46,7 +46,7 @@ uv run python -m data.scripts.generate_synthetic \
   --limit 12000
 ```
 
-**Multi-turn conversations** (~20K conversations):
+**Multi-turn conversations**:
 
 ```bash
 uv run python -m data.scripts.generate_synthetic \
@@ -58,4 +58,27 @@ uv run python -m data.scripts.generate_synthetic \
   --limit 20000
 ```
 
-Options: `--provider anthropic|openai|round-robin`, `--concurrency N`, `--limit N`. The script auto-resumes on interrupt via a `.progress.jsonl` sidecar file. Errors are logged to `<output>.errors.jsonl`.
+Options: `--provider anthropic|openai|round-robin`, `--model MODEL` (or `--model anthropic=MODEL --model openai=MODEL` for round-robin), `--concurrency N`, `--limit N`. The script auto-resumes on interrupt via a `.progress.jsonl` sidecar file. Errors are logged to `<output>.errors.jsonl`.
+
+## Quality judging (LLM-as-judge)
+
+Grades synthetic data against a 5-dimension rubric (routing, faithfulness, naturalness, quality, relevance) using a stronger LLM. Outputs a scored copy and a filtered "clean" dataset.
+
+```bash
+uv run python -m data.scripts.judge_synthetic \
+  --mode tools \
+  --input data/synthetic/tools.jsonl \
+  --output data/synthetic/tools.judged.jsonl \
+  --provider anthropic \
+  --model claude-sonnet-4-6 \
+  --concurrency 10 \
+  --threshold 2.4
+```
+
+Outputs:
+
+- `tools.judged.jsonl` — every row with an added `"judge"` key containing scores and explanation
+- `tools.clean.jsonl` — only rows passing the threshold (same schema as input, ready for training)
+- `stderr` — summary report with score distributions, pass/fail rate, and cost
+
+Options: `--provider anthropic|openai|round-robin`, `--model MODEL`, `--threshold N` (average score to pass, default 2.4), `--limit N` (spot-check a subset). Auto-resumes via `.progress.jsonl` sidecar.

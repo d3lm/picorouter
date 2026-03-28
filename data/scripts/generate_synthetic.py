@@ -1,7 +1,7 @@
 """Generate synthetic training data via LLM APIs.
 
 Supports tool-calling and multi-turn conversation generation using
-Anthropic (Claude 3.5 Haiku) and OpenAI (GPT-4o-mini) as providers.
+Anthropic and OpenAI as providers.
 
 Usage:
   uv run python -m data.scripts.generate_synthetic \
@@ -16,7 +16,9 @@ Usage:
     --mode multiturn \
     --input data/sources/simplewiki_passages.jsonl \
     --output data/synthetic/multiturn.jsonl \
-    --provider anthropic \
+    --provider round-robin \
+    --model anthropic=claude-sonnet-4-6 \
+    --model openai=gpt-5.4 \
     --concurrency 10 \
     --limit 20000
 """
@@ -43,8 +45,10 @@ ROOT = Path(__file__).resolve().parents[2]
 TOOL_SCHEMAS_PATH = ROOT / "data" / "tool_schemas.json"
 
 PRICING = {
-  "claude-haiku-4-5-20251001": {"input": 1.00 / 1_000_000, "output": 5.00 / 1_000_000},
+  "claude-haiku-4-5": {"input": 1.00 / 1_000_000, "output": 5.00 / 1_000_000},
+  "claude-sonnet-4-6": {"input": 3.00 / 1_000_000, "output": 15.00 / 1_000_000},
   "gpt-4o-mini": {"input": 0.15 / 1_000_000, "output": 0.60 / 1_000_000},
+  "gpt-5.4": {"input": 2.50 / 1_000_000, "output": 15.00 / 1_000_000},
 }
 
 
@@ -117,12 +121,18 @@ class LLMProvider(ABC):
     """Send prompt, return (response_text, model_name, input_tokens, output_tokens)."""
 
 
+DEFAULT_MODELS = {
+  "anthropic": "claude-sonnet-4-6",
+  "openai": "gpt-5.4",
+}
+
+
 class AnthropicProvider(LLMProvider):
-  def __init__(self):
+  def __init__(self, model: str | None = None):
     import anthropic
 
     self.client = anthropic.AsyncAnthropic()
-    self.model = "claude-haiku-4-5-20251001"
+    self.model = model or DEFAULT_MODELS["anthropic"]
 
   async def generate(self, prompt: str) -> tuple[str, str, int, int]:
     import anthropic
@@ -154,11 +164,11 @@ class AnthropicProvider(LLMProvider):
 
 
 class OpenAIProvider(LLMProvider):
-  def __init__(self):
+  def __init__(self, model: str | None = None):
     import openai
 
     self.client = openai.AsyncOpenAI()
-    self.model = "gpt-4o-mini"
+    self.model = model or DEFAULT_MODELS["openai"]
 
   async def generate(self, prompt: str) -> tuple[str, str, int, int]:
     import openai
@@ -167,7 +177,7 @@ class OpenAIProvider(LLMProvider):
       try:
         response = await self.client.chat.completions.create(
           model=self.model,
-          max_tokens=2048,
+          max_completion_tokens=64000,
           messages=[{"role": "user", "content": prompt}],
         )
 
@@ -193,19 +203,21 @@ class OpenAIProvider(LLMProvider):
 class RoundRobinProvider(LLMProvider):
   """Alternates between Anthropic and OpenAI to stay under per-provider rate limits."""
 
-  def __init__(self):
+  def __init__(self, models: dict[str, str] | None = None):
     self._providers: list[LLMProvider] = []
     self._idx = 0
+    models = models or {}
 
     if os.environ.get("ANTHROPIC_API_KEY"):
-      self._providers.append(AnthropicProvider())
+      self._providers.append(AnthropicProvider(model=models.get("anthropic")))
+
     if os.environ.get("OPENAI_API_KEY"):
-      self._providers.append(OpenAIProvider())
+      self._providers.append(OpenAIProvider(model=models.get("openai")))
 
     if not self._providers:
       raise RuntimeError("Round-robin requires at least one of ANTHROPIC_API_KEY or OPENAI_API_KEY")
 
-    log.info("Round-robin with %d providers: %s", len(self._providers), [type(p).__name__ for p in self._providers])
+    log.info("Round-robin with %d providers: %s", len(self._providers), [p.model for p in self._providers])
 
   async def generate(self, prompt: str) -> tuple[str, str, int, int]:
     provider = self._providers[self._idx % len(self._providers)]
@@ -213,15 +225,41 @@ class RoundRobinProvider(LLMProvider):
     return await provider.generate(prompt)
 
 
-def make_provider(name: str) -> LLMProvider:
-  if name == "anthropic":
-    return AnthropicProvider()
-  elif name == "openai":
-    return OpenAIProvider()
-  elif name == "round-robin":
-    return RoundRobinProvider()
-  else:
-    raise ValueError(f"Unknown provider: {name}")
+def _parse_model_args(raw: list[str] | None) -> tuple[str | None, dict[str, str]]:
+  """Parse --model values into (single_model, per_provider_models).
+
+  Plain values like "gpt-5.4" become the single model.
+  Values like "openai=gpt-5.4" populate the per-provider dict.
+  """
+  if not raw:
+    return None, {}
+
+  single: str | None = None
+  per_provider: dict[str, str] = {}
+
+  for entry in raw:
+    if "=" in entry:
+      provider, _, model = entry.partition("=")
+      per_provider[provider.strip()] = model.strip()
+    else:
+      single = entry.strip()
+
+  return single, per_provider
+
+
+def make_provider(name: str, model: str | None = None, models: dict[str, str] | None = None) -> LLMProvider:
+  if name == "round-robin":
+    return RoundRobinProvider(models=models)
+
+  factories: dict[str, type[LLMProvider]] = {
+    "anthropic": AnthropicProvider,
+    "openai": OpenAIProvider,
+  }
+
+  if name not in factories:
+    raise ValueError(f"Unknown provider: {name}. Choose from: anthropic, openai, round-robin")
+
+  return factories[name](model=model)
 
 
 def extract_json(text: str) -> Any:
@@ -230,7 +268,9 @@ def extract_json(text: str) -> Any:
 
   if text.startswith("```"):
     lines = text.split("\n")
-    lines = lines[1:]  # drop opening fence
+
+    # drop opening fence
+    lines = lines[1:]
 
     if lines and lines[-1].strip() == "```":
       lines = lines[:-1]
@@ -247,6 +287,12 @@ exactly 7 examples:
 
 - 4 questions where the correct response is a tool_call (the context does NOT contain the answer, but a tool can help)
 - 3 questions where the answer IS in the context (no tool needed)
+
+CRITICAL RULES:
+- Before making a tool_call, verify the context does NOT already answer the question.
+  If ANY part of the context addresses the question, it MUST be a context_answer, not a tool_call.
+- Tool-call questions should be things a user might naturally ask that genuinely require
+  external data (live weather, calculations, translations) — not questions the passage covers.
 
 For tool calls, the response must be a JSON object: {{"tool_call": {{"name": "...", "arguments": {{...}}}}}}
 For context answers, respond with a grounded answer citing the context with [source: sentence N].
@@ -671,6 +717,13 @@ def main():
     choices=["anthropic", "openai", "round-robin"],
     help="LLM provider (default: round-robin)",
   )
+  parser.add_argument(
+    "--model",
+    action="append",
+    default=None,
+    help="Model override. Plain value for single providers (e.g. gpt-5.4). "
+    "For round-robin use PROVIDER=MODEL (repeatable, e.g. --model anthropic=claude-sonnet-4-6 --model openai=gpt-5.4)",
+  )
   parser.add_argument("--concurrency", type=int, default=10, help="Max concurrent API requests (default: 10)")
   parser.add_argument("--limit", type=int, default=None, help="Max passages to process")
   parser.add_argument("--errors", type=Path, default=None, help="Error log file (default: <output>.errors.jsonl)")
@@ -698,7 +751,8 @@ def main():
 
   errors_path = args.errors or args.output.with_suffix(".errors.jsonl")
 
-  provider = make_provider(args.provider)
+  model, models = _parse_model_args(args.model)
+  provider = make_provider(args.provider, model=model, models=models)
   passages = load_passages(args.input, args.limit)
 
   log.info("Loaded %d passages from %s", len(passages), args.input)
