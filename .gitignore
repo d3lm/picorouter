@@ -19,3 +19,5 @@ data/sources/
 data/synthetic/
 .cursor
 .env
+processed/
+!processed/seed.jsonl

@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 
-from tokenizers import Tokenizer, models, pre_tokenizers, trainers
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
 SPECIAL_TOKENS = [
   "<|pad|>",
@@ -17,7 +17,7 @@ SPECIAL_TOKENS = [
   "<|refuse|>",
 ]
 
-DEFAULT_VOCAB_SIZE = 512
+DEFAULT_VOCAB_SIZE = 8192
 MODEL_DIR = Path(__file__).parent
 TOKENIZER_PATH = MODEL_DIR / "tokenizer.json"
 SEED_DATA_PATH = MODEL_DIR.parent / "data" / "processed" / "seed.jsonl"
@@ -45,6 +45,7 @@ def train_tokenizer(vocab_size: int = DEFAULT_VOCAB_SIZE, data_path: Path = SEED
   """Train a BPE tokenizer on seed data."""
   tokenizer = Tokenizer(models.BPE())
   tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+  tokenizer.decoder = decoders.ByteLevel()
 
   trainer = trainers.BpeTrainer(
     vocab_size=vocab_size,

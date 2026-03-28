@@ -48,6 +48,7 @@ def apply_rope(x: mx.array, cos_freq: mx.array, sin_freq: mx.array, offset: int 
   x2 = x[..., 1::2]
 
   rotated = mx.concatenate([x1 * cos_f - x2 * sin_f, x1 * sin_f + x2 * cos_f], axis=-1)
+
   return rotated
 
 
@@ -98,6 +99,7 @@ class Attention(nn.Module):
 
     attn = mx.softmax(attn, axis=-1)
     out = (attn @ v).transpose(0, 2, 1, 3).reshape(B, L, -1)
+
     return self.o_proj(out), new_cache
 
 
