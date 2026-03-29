@@ -21,13 +21,41 @@ uv sync --dev
 
 ## Usage
 
-```bash
-# Train tokenizer + model on seed data (tracer bullet)
-uv run python model/tokenizer.py
-uv run python model/train.py
+### Data pipeline
 
+```bash
+# Quality-filter, train tokenizer, tokenize + split → train/val/test.npz
+uv run python -m data.scripts.merge_and_tokenize --step all
+```
+
+### Training
+
+```bash
+# Full production training (~4-8h on Apple Silicon)
+uv run python -m model.train
+
+# Customize hyperparameters
+uv run python -m model.train --epochs 5 --batch-size 32 --peak-lr 1e-4
+```
+
+### Evaluation
+
+```bash
+# Evaluate all checkpoints and select the best
+uv run python -m model.evaluate
+
+# Evaluate a specific checkpoint
+uv run python -m model.evaluate --checkpoint model/checkpoints/step-9000
+
+# Skip latency benchmark (faster)
+uv run python -m model.evaluate --skip-latency
+```
+
+### Export & misc
+
+```bash
 # Export to ONNX
-uv run python model/export_onnx.py
+uv run python -m model.export_onnx
 
 # Lint / format
 uv run ruff check .
@@ -41,20 +69,18 @@ picochat/
   pyproject.toml
   data/
     sources/           # raw source corpora
-    open_datasets/     # converted open datasets
+    open_datasets/     # converted open datasets (+ raw/)
     synthetic/         # LLM-generated data
-    processed/         # final merged, shuffled, tokenized
+    processed/         # final merged, shuffled, tokenized splits
     scripts/           # data pipeline scripts
+    tool_schemas.json  # tool definitions for training data
   model/
     architecture.py    # MLX model definition
     tokenizer.py       # tokenizer training + loading
-    train.py           # training loop
-    evaluate.py        # eval metrics
+    tokenizer.json     # production BPE tokenizer (8192 vocab)
+    train.py           # production training loop
+    evaluate.py        # evaluation suite (F1, tool acc, refusal, hallucination, latency)
     export_onnx.py     # MLX → ONNX conversion
-  browser/             # React + Vite + Tailwind app
-    src/
-      App.tsx          # main UI component
-      inference.ts     # ONNX Runtime Web inference
-      retrieval.ts     # TF-IDF search (placeholder)
-    public/            # static assets (model, tokenizer)
+    checkpoints/       # saved model weights (gitignored)
+  browser/             # browser app
 ```
