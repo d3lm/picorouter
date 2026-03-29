@@ -98,7 +98,8 @@ class Attention(nn.Module):
     if attn_mask is not None:
       out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
     else:
-      is_causal = cache is None and L > 1
+      # keep this as a Python bool for ONNX tracing compatibility
+      is_causal = cache is None
       out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
     out = out.transpose(1, 2).reshape(B, L, -1)
