@@ -29,9 +29,9 @@ export default function App() {
         setLoading(false);
       })
       .catch((error: any) => {
-        setOutput(
-          `Error loading model: ${error.message}\n\nMake sure picorouter.onnx and tokenizer.json are in the public/ directory.`,
-        );
+        console.error(error);
+
+        setOutput(`Error loading model: Make sure picorouter.onnx and tokenizer.json are in public/.`);
 
         setStatus('Load failed');
         setLoading(false);
