@@ -1,5 +1,5 @@
 {
-  "name": "@picochat/playground",
+  "name": "@picorouter/playground",
   "private": true,
   "type": "module",
   "scripts": {

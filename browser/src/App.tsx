@@ -73,7 +73,7 @@ export default function App() {
 
   return (
     <div className="mx-auto max-w-2xl px-4 py-8">
-      <h1 className="text-2xl font-bold">PicoChat</h1>
+      <h1 className="text-2xl font-bold">PicoRouter</h1>
       <p className="mt-1 mb-6 text-sm text-gray-500">Tracer bullet — end-to-end pipeline test</p>
 
       <div className="mb-4 rounded-lg border border-gray-200 bg-white p-4">

@@ -65,7 +65,7 @@ uv run ruff format .
 ## Project Structure
 
 ```
-picochat/
+picorouter/
   pyproject.toml
   data/
     sources/           # raw source corpora
