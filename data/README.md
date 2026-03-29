@@ -1,4 +1,4 @@
-# Data layout
+# Data Layout
 
 | Path             | Purpose                                                                                   |
 | ---------------- | ----------------------------------------------------------------------------------------- |
@@ -10,7 +10,7 @@
 
 Large or reproducible trees under `open_datasets/`, `sources/`, and `synthetic/` are gitignored; regenerate locally as needed.
 
-## Open datasets
+## Open Datasets
 
 From the repo root:
 
@@ -20,7 +20,7 @@ uv run python -m data.scripts.convert_open_datasets --dataset all
 
 Use `--dataset squad2`, `coqa`, or `drop` for one dataset. Add `--spot-check N` for random samples. Outputs: `open_datasets/squad2.jsonl`, `coqa.jsonl`, `drop.jsonl`.
 
-## Wikipedia passages (optional)
+## Wikipedia Passages (optional)
 
 Used as input for synthetic data generation later:
 
@@ -30,7 +30,7 @@ uv run python -m data.scripts.download_sources --source simplewiki --resume
 
 `--source enwiki_curated` or `--source all` are also supported.
 
-## Synthetic data generation
+## Synthetic Data Generation
 
 Requires `ANTHROPIC_API_KEY` and/or `OPENAI_API_KEY` environment variables.
 
@@ -60,7 +60,7 @@ uv run python -m data.scripts.generate_synthetic \
 
 Options: `--provider anthropic|openai|round-robin`, `--model MODEL` (or `--model anthropic=MODEL --model openai=MODEL` for round-robin), `--concurrency N`, `--limit N`. The script auto-resumes on interrupt via a `.progress.jsonl` sidecar file. Errors are logged to `<output>.errors.jsonl`.
 
-## Quality judging (LLM-as-judge)
+## Quality Judging (LLM-as-Judge)
 
 Grades synthetic data against a 5-dimension rubric (routing, faithfulness, naturalness, quality, relevance) using a stronger LLM. Outputs a scored copy and a filtered "clean" dataset.
 
