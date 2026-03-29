@@ -57,7 +57,6 @@ Decoder-only transformer (LLaMA-style) with RMSNorm, RoPE, SwiGLU, and tied embe
 ## Setup
 
 ```bash
-uv sync
 uv sync --dev
 ```
 
