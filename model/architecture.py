@@ -34,10 +34,15 @@ def apply_rope(
   cos_freq: torch.Tensor,
   sin_freq: torch.Tensor,
   offset: int = 0,
+  position_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
-  seq_len = x.shape[2]
-  cos_f = cos_freq[offset : offset + seq_len].unsqueeze(0).unsqueeze(1)
-  sin_f = sin_freq[offset : offset + seq_len].unsqueeze(0).unsqueeze(1)
+  if position_ids is not None:
+    cos_f = cos_freq[position_ids].unsqueeze(1)
+    sin_f = sin_freq[position_ids].unsqueeze(1)
+  else:
+    seq_len = x.shape[2]
+    cos_f = cos_freq[offset : offset + seq_len].unsqueeze(0).unsqueeze(1)
+    sin_f = sin_freq[offset : offset + seq_len].unsqueeze(0).unsqueeze(1)
 
   x1 = x[..., ::2]
   x2 = x[..., 1::2]
@@ -62,8 +67,9 @@ class Attention(nn.Module):
     x: torch.Tensor,
     cos_freq: torch.Tensor,
     sin_freq: torch.Tensor,
-    mask: torch.Tensor | None = None,
     cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+    attn_mask: torch.Tensor | None = None,
+    position_ids: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     B, L, _ = x.shape
 
@@ -71,13 +77,17 @@ class Attention(nn.Module):
     k = self.k_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
     v = self.v_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
 
-    offset = 0
+    if position_ids is not None:
+      q = apply_rope(q, cos_freq, sin_freq, position_ids=position_ids)
+      k = apply_rope(k, cos_freq, sin_freq, position_ids=position_ids)
+    else:
+      offset = 0
 
-    if cache is not None:
-      offset = cache[0].shape[2]
+      if cache is not None:
+        offset = cache[0].shape[2]
 
-    q = apply_rope(q, cos_freq, sin_freq, offset)
-    k = apply_rope(k, cos_freq, sin_freq, offset)
+      q = apply_rope(q, cos_freq, sin_freq, offset)
+      k = apply_rope(k, cos_freq, sin_freq, offset)
 
     if cache is not None:
       k = torch.cat([cache[0], k], dim=2)
@@ -85,14 +95,13 @@ class Attention(nn.Module):
 
     new_cache = (k, v)
 
-    scale = self.head_dim**-0.5
-    attn = (q @ k.transpose(-2, -1)) * scale
+    if attn_mask is not None:
+      out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+    else:
+      is_causal = cache is None and L > 1
+      out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
-    if mask is not None:
-      attn = attn + mask
-
-    attn = F.softmax(attn, dim=-1)
-    out = (attn @ v).transpose(1, 2).reshape(B, L, -1)
+    out = out.transpose(1, 2).reshape(B, L, -1)
 
     return self.o_proj(out), new_cache
 
@@ -121,10 +130,11 @@ class TransformerBlock(nn.Module):
     x: torch.Tensor,
     cos_freq: torch.Tensor,
     sin_freq: torch.Tensor,
-    mask: torch.Tensor | None = None,
     cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+    attn_mask: torch.Tensor | None = None,
+    position_ids: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-    h, new_cache = self.attention(self.attn_norm(x), cos_freq, sin_freq, mask, cache)
+    h, new_cache = self.attention(self.attn_norm(x), cos_freq, sin_freq, cache, attn_mask, position_ids)
     x = x + h
     x = x + self.ffn(self.ffn_norm(x))
     return x, new_cache
@@ -149,21 +159,18 @@ class PicoRouter(nn.Module):
     self,
     token_ids: torch.Tensor,
     cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+    attn_mask: torch.Tensor | None = None,
+    position_ids: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
-    _B, L = token_ids.shape
     x = self.embed(token_ids)
 
     if cache is None:
-      mask = torch.triu(torch.full((L, L), float("-inf"), device=x.device), diagonal=1)
-      mask = mask.unsqueeze(0).unsqueeze(0)
       cache = [None] * self.config.num_layers
-    else:
-      mask = None
 
     new_cache = []
 
     for i, layer in enumerate(self.layers):
-      x, layer_cache = layer(x, self._cos_freq, self._sin_freq, mask, cache[i])
+      x, layer_cache = layer(x, self._cos_freq, self._sin_freq, cache[i], attn_mask, position_ids)
       new_cache.append(layer_cache)
 
     x = self.norm(x)

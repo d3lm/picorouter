@@ -25,8 +25,10 @@ CHECKPOINT_DIR = Path(__file__).parent / "checkpoints"
 DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "processed"
 FILTERED_PATH = DATA_DIR / "filtered.jsonl"
 EVAL_REPORT_PATH = Path(__file__).parent / "eval_report.json"
+CACHED_TEST_PATH = DATA_DIR / "cached_test_split.json"
 
 REFUSAL_PHRASE = "I don't have enough information"
+DEFAULT_BATCH_SIZE = 32
 
 
 def get_device(override: str | None = None) -> torch.device:
@@ -39,7 +41,11 @@ def get_device(override: str | None = None) -> torch.device:
   return torch.device("cpu")
 
 
-def load_model(checkpoint_dir: Path, device: torch.device) -> tuple[PicoRouter, PicoConfig]:
+def load_model(
+  checkpoint_dir: Path,
+  device: torch.device,
+  compile_model: bool = True,
+) -> tuple[PicoRouter, PicoConfig]:
   with open(checkpoint_dir / "config.json") as config_file:
     cfg = PicoConfig(**json.load(config_file))
 
@@ -49,6 +55,10 @@ def load_model(checkpoint_dir: Path, device: torch.device) -> tuple[PicoRouter, 
   state_dict = torch.load(weights_path, map_location=device, weights_only=True)
   model.load_state_dict(state_dict)
   model.eval()
+
+  if compile_model:
+    print("  Compiling model with torch.compile...")
+    model = torch.compile(model)
 
   return model, cfg
 
@@ -61,7 +71,7 @@ def generate(
   device: torch.device,
   max_new_tokens: int = 256,
 ) -> list[int]:
-  """Greedy autoregressive generation with KV-cache."""
+  """Greedy autoregressive generation with KV-cache (single example)."""
   generated = []
   cache = None
   input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
@@ -82,13 +92,129 @@ def generate(
   return generated
 
 
+@torch.no_grad()
+def generate_batch(
+  model: PicoRouter,
+  token_ids_list: list[list[int]],
+  eos_id: int,
+  device: torch.device,
+  max_new_tokens: int = 256,
+  batch_size: int = DEFAULT_BATCH_SIZE,
+) -> list[list[int]]:
+  """Batched greedy autoregressive generation with KV-cache.
+
+  Left-pads variable-length prompts, builds per-example position_ids for
+  correct RoPE encoding, and uses explicit attention masks to ignore padding.
+  """
+  if not token_ids_list:
+    return []
+
+  all_generated: list[list[int]] = []
+
+  for batch_start in range(0, len(token_ids_list), batch_size):
+    batch_tokens = token_ids_list[batch_start : batch_start + batch_size]
+    gen = _generate_one_batch(model, batch_tokens, eos_id, device, max_new_tokens)
+    all_generated.extend(gen)
+
+  return all_generated
+
+
+def _generate_one_batch(
+  model: PicoRouter,
+  batch_tokens: list[list[int]],
+  eos_id: int,
+  device: torch.device,
+  max_new_tokens: int,
+) -> list[list[int]]:
+  B = len(batch_tokens)
+
+  if B == 0:
+    return []
+
+  prompt_lengths = [len(tokens) for tokens in batch_tokens]
+  max_prompt_length = max(prompt_lengths)
+  padding_lengths = [max_prompt_length - prompt_length for prompt_length in prompt_lengths]
+
+  padded = torch.zeros(B, max_prompt_length, dtype=torch.long, device=device)
+
+  for i, tokens in enumerate(batch_tokens):
+    padded[i, padding_lengths[i] :] = torch.tensor(tokens, dtype=torch.long, device=device)
+
+  position_ids = torch.zeros(B, max_prompt_length, dtype=torch.long, device=device)
+
+  for i in range(B):
+    position_ids[i, padding_lengths[i] :] = torch.arange(prompt_lengths[i], device=device)
+
+  causal = torch.tril(torch.ones(max_prompt_length, max_prompt_length, dtype=torch.bool, device=device))
+
+  key_mask = torch.zeros(B, max_prompt_length, dtype=torch.bool, device=device)
+
+  for i in range(B):
+    key_mask[i, padding_lengths[i] :] = True
+
+  attn_mask = causal.unsqueeze(0).unsqueeze(0) & key_mask.unsqueeze(1).unsqueeze(2)
+
+  logits, cache = model(padded, None, attn_mask=attn_mask, position_ids=position_ids)
+  next_tokens = torch.argmax(logits[:, -1, :], dim=-1)
+
+  finished = next_tokens == eos_id
+  generated: list[list[int]] = [[] for _ in range(B)]
+
+  for i in range(B):
+    if not finished[i]:
+      generated[i].append(next_tokens[i].item())
+
+  max_total_kv = max_prompt_length + max_new_tokens
+
+  decode_mask_full = torch.ones(B, 1, 1, max_total_kv, dtype=torch.bool, device=device)
+
+  for i in range(B):
+    decode_mask_full[i, 0, 0, : padding_lengths[i]] = False
+
+  current_pos = torch.tensor(prompt_lengths, dtype=torch.long, device=device)
+
+  for step in range(1, max_new_tokens):
+    if finished.all():
+      break
+
+    input_ids = next_tokens.unsqueeze(1)
+    kv_len = max_prompt_length + step
+    decode_mask = decode_mask_full[:, :, :, :kv_len]
+    decode_pos = current_pos.unsqueeze(1)
+
+    logits, cache = model(input_ids, cache, attn_mask=decode_mask, position_ids=decode_pos)
+    next_tokens = torch.argmax(logits[:, -1, :], dim=-1)
+    current_pos += 1
+
+    for i in range(B):
+      if not finished[i]:
+        if next_tokens[i].item() == eos_id:
+          finished[i] = True
+        else:
+          generated[i].append(next_tokens[i].item())
+
+  return generated
+
+
 def load_test_examples() -> dict[str, list[dict]]:
   """Load filtered.jsonl and split into categories for evaluation.
 
   Mirrors the training pipeline: tokenize each example, discard those
   exceeding max_seq_len, shuffle with the same seed, then apply the
   same 90/5/5 split. Returns only the test portion grouped by type.
+
+  Caches the result to disk so subsequent runs skip the tokenization pass.
   """
+  if (
+    CACHED_TEST_PATH.exists()
+    and FILTERED_PATH.exists()
+    and CACHED_TEST_PATH.stat().st_mtime > FILTERED_PATH.stat().st_mtime
+  ):
+    print("  (loading cached test split)")
+
+    with open(CACHED_TEST_PATH, encoding="utf-8") as cached_test_file:
+      return json.load(cached_test_file)
+
   tokenizer = load_tokenizer()
 
   kept = []
@@ -130,6 +256,11 @@ def load_test_examples() -> dict[str, list[dict]]:
       groups["tool"].append(ex)
     else:
       groups["rc"].append(ex)
+
+  with open(CACHED_TEST_PATH, "w", encoding="utf-8") as cached_test_file:
+    json.dump(groups, cached_test_file)
+
+  print(f"  (cached test split to {CACHED_TEST_PATH})")
 
   return groups
 
@@ -218,26 +349,29 @@ def eval_extractive(
   examples: list[dict],
   device: torch.device,
   max_examples: int = 2000,
+  batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> dict:
   eos_id = tokenizer.token_to_id("<|eos|>")
   subset = examples[:max_examples]
-  f1s, ems = [], []
 
-  for ex in subset:
-    prompt = build_prompt_tokens(tokenizer, ex)
-    gen_ids = generate(model, prompt, eos_id, device)
+  prompts = [build_prompt_tokens(tokenizer, example) for example in subset]
+  all_gen_ids = generate_batch(model, prompts, eos_id, device, batch_size=batch_size)
+
+  f1_scores, exact_match_scores = [], []
+
+  for gen_ids, example in zip(all_gen_ids, subset, strict=True):
     prediction = tokenizer.decode(gen_ids)
-    gold = get_gold_answer(ex)
-    f1, em = token_f1(prediction, gold)
-    f1s.append(f1)
-    ems.append(em)
+    gold = get_gold_answer(example)
+    f1_score, exact_match = token_f1(prediction, gold)
+    f1_scores.append(f1_score)
+    exact_match_scores.append(exact_match)
 
-  n = len(f1s)
+  n = len(f1_scores)
 
   return {
-    "mean_f1": round(sum(f1s) / max(n, 1), 4),
-    "mean_em": round(sum(ems) / max(n, 1), 4),
-    "median_f1": round(sorted(f1s)[n // 2] if f1s else 0.0, 4),
+    "mean_f1": round(sum(f1_scores) / max(n, 1), 4),
+    "mean_em": round(sum(exact_match_scores) / max(n, 1), 4),
+    "median_f1": round(sorted(f1_scores)[n // 2] if f1_scores else 0.0, 4),
     "n": n,
   }
 
@@ -252,6 +386,7 @@ def parse_tool_call(text: str) -> dict | None:
   text = text.strip()
 
   json_match = re.search(r'\{[^{}]*"name"\s*:', text)
+
   if json_match:
     candidate = text[json_match.start() :]
     brace_depth = 0
@@ -262,6 +397,7 @@ def parse_tool_call(text: str) -> dict | None:
         brace_depth += 1
       elif ch == "}":
         brace_depth -= 1
+
         if brace_depth == 0:
           end = i + 1
           break
@@ -269,6 +405,7 @@ def parse_tool_call(text: str) -> dict | None:
     if end:
       try:
         parsed = json.loads(candidate[:end])
+
         if "name" in parsed:
           return parsed
       except json.JSONDecodeError:
@@ -286,23 +423,28 @@ def eval_tool_accuracy(
   model: PicoRouter,
   tokenizer,
   tool_examples: list[dict],
-  rc_examples: list[dict],
   device: torch.device,
   max_examples: int = 2000,
+  batch_size: int = DEFAULT_BATCH_SIZE,
+  *,
+  rc_gen_ids: list[list[int]],
+  rc_predictions: list[str],
 ) -> dict:
   eos_id = tokenizer.token_to_id("<|eos|>")
   tool_call_id = tokenizer.token_to_id("<|tool_call|>")
   tool_subset = tool_examples[:max_examples]
 
+  prompts = [build_prompt_tokens(tokenizer, ex) for ex in tool_subset]
+  all_gen_ids = generate_batch(model, prompts, eos_id, device, batch_size=batch_size)
+
   routing_correct = 0
   name_correct = 0
   full_match = 0
 
-  for ex in tool_subset:
-    prompt = build_prompt_tokens(tokenizer, ex)
-    gen_ids = generate(model, prompt, eos_id, device)
+  for gen_ids, example in zip(all_gen_ids, tool_subset, strict=True):
     prediction = tokenizer.decode(gen_ids)
-    gold = get_gold_answer(ex)
+
+    gold = get_gold_answer(example)
 
     pred_has_tool = tool_call_id in gen_ids or parse_tool_call(prediction) is not None
 
@@ -321,18 +463,12 @@ def eval_tool_accuracy(
   n_tool = len(tool_subset)
 
   false_tool = 0
-  rc_subset = rc_examples[:500]
 
-  for ex in rc_subset:
-    prompt = build_prompt_tokens(tokenizer, ex)
-    gen_ids = generate(model, prompt, eos_id, device)
-
-    prediction = tokenizer.decode(gen_ids)
-
+  for gen_ids, prediction in zip(rc_gen_ids, rc_predictions, strict=True):
     if tool_call_id in gen_ids or parse_tool_call(prediction) is not None:
       false_tool += 1
 
-  n_rc = len(rc_subset)
+  n_rc = len(rc_gen_ids)
 
   return {
     "routing_accuracy": round(routing_correct / max(n_tool, 1), 4),
@@ -348,39 +484,37 @@ def eval_refusal(
   model: PicoRouter,
   tokenizer,
   refusal_examples: list[dict],
-  rc_examples: list[dict],
   device: torch.device,
   max_examples: int = 2000,
+  batch_size: int = DEFAULT_BATCH_SIZE,
+  *,
+  rc_gen_ids: list[list[int]],
+  rc_predictions: list[str],
 ) -> dict:
   eos_id = tokenizer.token_to_id("<|eos|>")
   refuse_id = tokenizer.token_to_id("<|refuse|>")
 
-  correct_refusals = 0
   refusal_subset = refusal_examples[:max_examples]
 
-  for ex in refusal_subset:
-    prompt = build_prompt_tokens(tokenizer, ex)
-    gen_ids = generate(model, prompt, eos_id, device)
+  prompts = [build_prompt_tokens(tokenizer, ex) for ex in refusal_subset]
+  all_gen_ids = generate_batch(model, prompts, eos_id, device, batch_size=batch_size)
 
+  correct_refusals = 0
+
+  for gen_ids in all_gen_ids:
     prediction = tokenizer.decode(gen_ids)
 
     if REFUSAL_PHRASE.lower() in prediction.lower() or refuse_id in gen_ids:
       correct_refusals += 1
 
   false_refusals = 0
-  rc_subset = rc_examples[:500]
 
-  for ex in rc_subset:
-    prompt = build_prompt_tokens(tokenizer, ex)
-    gen_ids = generate(model, prompt, eos_id, device)
-
-    prediction = tokenizer.decode(gen_ids)
-
+  for gen_ids, prediction in zip(rc_gen_ids, rc_predictions, strict=True):
     if REFUSAL_PHRASE.lower() in prediction.lower() or refuse_id in gen_ids:
       false_refusals += 1
 
   n_ref = len(refusal_subset)
-  n_rc = len(rc_subset)
+  n_rc = len(rc_gen_ids)
 
   return {
     "correct_refusal_rate": round(correct_refusals / max(n_ref, 1), 4),
@@ -402,9 +536,9 @@ def build_adversarial_examples(
   rng = random.Random(seed)
 
   pool = [
-    ex
-    for ex in examples
-    if not any(REFUSAL_PHRASE in t["content"] for t in ex["conversation"] if t["role"] == "assistant")
+    example
+    for example in examples
+    if not any(REFUSAL_PHRASE in t["content"] for t in example["conversation"] if t["role"] == "assistant")
   ]
 
   if len(pool) < 2:
@@ -436,18 +570,20 @@ def eval_hallucination(
   all_examples: list[dict],
   device: torch.device,
   n_probes: int = 500,
+  batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> dict:
   eos_id = tokenizer.token_to_id("<|eos|>")
   refuse_id = tokenizer.token_to_id("<|refuse|>")
 
   adversarial = build_adversarial_examples(all_examples, n=n_probes)
+
+  prompts = [build_prompt_tokens(tokenizer, ex) for ex in adversarial]
+  all_gen_ids = generate_batch(model, prompts, eos_id, device, batch_size=batch_size)
+
   hallucinations = 0
 
-  for ex in adversarial:
-    prompt = build_prompt_tokens(tokenizer, ex)
-    gen_ids = generate(model, prompt, eos_id, device)
+  for gen_ids in all_gen_ids:
     prediction = tokenizer.decode(gen_ids)
-
     is_refusal = REFUSAL_PHRASE.lower() in prediction.lower() or refuse_id in gen_ids
 
     if not is_refusal:
@@ -523,8 +659,11 @@ def eval_latency(
         generated += 1
 
       _sync_device(device)
+
       t_gen_end = time.perf_counter()
+
       gen_elapsed = t_gen_end - t_gen_start
+
       if generated > 0 and gen_elapsed > 0:
         tok_rates.append(generated / gen_elapsed)
 
@@ -577,9 +716,12 @@ def run_evaluation(
   max_refusal: int = 2000,
   n_hallucination: int = 500,
   skip_latency: bool = False,
+  batch_size: int = DEFAULT_BATCH_SIZE,
+  compile_model: bool = True,
 ) -> dict:
   print(f"\nLoading checkpoint: {checkpoint_dir}")
-  model, _ = load_model(checkpoint_dir, device)
+
+  model, _ = load_model(checkpoint_dir, device, compile_model=compile_model)
 
   tokenizer = load_tokenizer()
 
@@ -592,29 +734,65 @@ def run_evaluation(
   all_test = groups["rc"] + groups["tool"] + groups["refusal"]
   report = {"checkpoint": str(checkpoint_dir.name)}
 
+  eos_id = tokenizer.token_to_id("<|eos|>")
+  rc_fp_subset = groups["rc"][:500]
+
+  print(f"\n[0/5] Pre-generating RC false-positive predictions (N={len(rc_fp_subset)})...")
+
+  rc_fp_prompts = [build_prompt_tokens(tokenizer, ex) for ex in rc_fp_subset]
+  rc_fp_gen_ids = generate_batch(model, rc_fp_prompts, eos_id, device, batch_size=batch_size)
+  rc_fp_predictions = [tokenizer.decode(ids) for ids in rc_fp_gen_ids]
+
+  print("       done")
+
   print("\n[1/5] Extractive F1 / Exact Match...")
 
-  report["extractive"] = eval_extractive(model, tokenizer, groups["rc"], device, max_rc)
+  report["extractive"] = eval_extractive(model, tokenizer, groups["rc"], device, max_rc, batch_size)
 
   print(f"       F1={report['extractive']['mean_f1']}  EM={report['extractive']['mean_em']}")
 
   print("\n[2/5] Tool-call accuracy...")
 
-  report["tool_calling"] = eval_tool_accuracy(model, tokenizer, groups["tool"], groups["rc"], device, max_tool)
-  tc = report["tool_calling"]
+  report["tool_calling"] = eval_tool_accuracy(
+    model,
+    tokenizer,
+    groups["tool"],
+    device,
+    max_tool,
+    batch_size,
+    rc_gen_ids=rc_fp_gen_ids,
+    rc_predictions=rc_fp_predictions,
+  )
 
-  print(f"       Routing={tc['routing_accuracy']}  Name={tc['name_accuracy']}  Full={tc['full_match_accuracy']}")
+  tool_calling = report["tool_calling"]
+
+  print(
+    "       "
+    f"Routing={tool_calling['routing_accuracy']}  "
+    f"Name={tool_calling['name_accuracy']}  "
+    f"Full={tool_calling['full_match_accuracy']}"
+  )
 
   print("\n[3/5] Refusal rate...")
 
-  report["refusal"] = eval_refusal(model, tokenizer, groups["refusal"], groups["rc"], device, max_refusal)
+  report["refusal"] = eval_refusal(
+    model,
+    tokenizer,
+    groups["refusal"],
+    device,
+    max_refusal,
+    batch_size,
+    rc_gen_ids=rc_fp_gen_ids,
+    rc_predictions=rc_fp_predictions,
+  )
+
   ref = report["refusal"]
 
   print(f"       Correct={ref['correct_refusal_rate']}  FalseRefusal={ref['false_refusal_rate']}")
 
   print("\n[4/5] Hallucination probe...")
 
-  report["hallucination"] = eval_hallucination(model, tokenizer, all_test, device, n_hallucination)
+  report["hallucination"] = eval_hallucination(model, tokenizer, all_test, device, n_hallucination, batch_size)
 
   print(f"       Rate={report['hallucination']['hallucination_rate']}")
 
@@ -632,7 +810,9 @@ def run_evaluation(
   report["composite_score"] = round(score, 4)
 
   print("\n" + "=" * 50)
+
   print("PicoRouter Evaluation Report")
+
   print("=" * 50)
 
   print(f"Checkpoint: {checkpoint_dir.name}")
@@ -642,17 +822,23 @@ def run_evaluation(
   extractive = report["extractive"]
 
   print("Reading Comprehension:")
+
   print(f"  F1: {extractive['mean_f1']} | EM: {extractive['mean_em']} | N={extractive['n']}")
 
   print()
 
   print("Tool Calling:")
-  print(f"  Routing Accuracy: {tc['routing_accuracy']} | Name Accuracy: {tc['name_accuracy']}")
-  print(f"  Full Match: {tc['full_match_accuracy']} | False Tool-Call Rate: {tc['false_tool_call_rate']}")
+
+  print(f"  Routing Accuracy: {tool_calling['routing_accuracy']} | Name Accuracy: {tool_calling['name_accuracy']}")
+
+  print(
+    f"  Full Match: {tool_calling['full_match_accuracy']}  False Tool-Call Rate: {tool_calling['false_tool_call_rate']}"
+  )
 
   print()
 
   print("Refusal:")
+
   print(f"  Correct Refusal Rate: {ref['correct_refusal_rate']} | False Refusal Rate: {ref['false_refusal_rate']}")
 
   print()
@@ -660,12 +846,14 @@ def run_evaluation(
   hallucination = report["hallucination"]
 
   print("Hallucination Probe:")
+
   print(f"  Hallucination Rate: {hallucination['hallucination_rate']} (N={hallucination['n']})")
 
   if "latency" in report:
     print()
 
     device_label = str(device).upper()
+
     print(f"Latency ({device_label}):")
 
     for k, v in report["latency"].items():
@@ -673,7 +861,9 @@ def run_evaluation(
       print(f"  Context {ctx}: TTFT={v['ttft_ms']}ms, {v['tok_per_sec']} tok/s")
 
   print()
+
   print(f"Composite Score: {report['composite_score']}")
+
   print("=" * 50)
 
   return report
@@ -688,15 +878,20 @@ def main():
     default=None,
     help="Path to a specific checkpoint dir. If omitted, evaluates all checkpoints and selects the best.",
   )
+
   parser.add_argument("--max-rc", type=int, default=2000)
   parser.add_argument("--max-tool", type=int, default=2000)
   parser.add_argument("--max-refusal", type=int, default=2000)
   parser.add_argument("--n-hallucination", type=int, default=500)
   parser.add_argument("--skip-latency", action="store_true")
   parser.add_argument("--device", type=str, default=None, help="Force device (cuda, mps, cpu)")
+  parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Batch size for generation")
+  parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile")
   args = parser.parse_args()
 
   device = get_device(args.device)
+  compile_model = not args.no_compile
+
   print(f"Using device: {device}")
 
   if args.checkpoint:
@@ -710,6 +905,8 @@ def main():
       max_refusal=args.max_refusal,
       n_hallucination=args.n_hallucination,
       skip_latency=args.skip_latency,
+      batch_size=args.batch_size,
+      compile_model=compile_model,
     )
 
     with open(EVAL_REPORT_PATH, "w") as eval_report_file:
@@ -738,6 +935,8 @@ def main():
         max_refusal=args.max_refusal,
         n_hallucination=args.n_hallucination,
         skip_latency=args.skip_latency,
+        batch_size=args.batch_size,
+        compile_model=compile_model,
       )
 
       all_reports[checkpoint_dir.name] = report
@@ -764,8 +963,8 @@ def main():
     else:
       final_report = {}
 
-    with open(EVAL_REPORT_PATH, "w") as f:
-      json.dump(final_report, f, indent=2)
+    with open(EVAL_REPORT_PATH, "w") as eval_report_file:
+      json.dump(final_report, eval_report_file, indent=2)
 
     print(f"\nReport saved to {EVAL_REPORT_PATH}")
 

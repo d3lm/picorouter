@@ -2,7 +2,6 @@
 
 import argparse
 import json
-import math
 import random
 import signal
 import time
@@ -11,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 
 from model.architecture import PicoConfig, PicoRouter
 
@@ -31,10 +30,17 @@ def _handle_signal(signum, _frame):
 def get_device(override: str | None = None) -> torch.device:
   if override:
     return torch.device(override)
+
   if torch.cuda.is_available():
-    return torch.device("cuda")
+    try:
+      torch.cuda.init()
+      return torch.device("cuda")
+    except RuntimeError:
+      pass
+
   if torch.backends.mps.is_available():
     return torch.device("mps")
+
   return torch.device("cpu")
 
 
@@ -71,10 +77,13 @@ def compute_val_loss(
   batch_size: int,
   device: torch.device,
   max_examples: int = 2048,
+  use_amp: bool = False,
 ) -> float:
   """Compute average validation loss on a random subset."""
   model.eval()
+
   num_examples = min(len(val_ids), max_examples)
+
   indices = random.sample(range(len(val_ids)), num_examples)
 
   total_loss = 0.0
@@ -90,8 +99,10 @@ def compute_val_loss(
       target_tokens = torch.tensor(batch_ids[:, 1:], dtype=torch.long, device=device)
       token_mask = torch.tensor(batch_mask_np[:, 1:], dtype=torch.float32, device=device)
 
-      logits, _ = model(input_tokens)
-      per_token_loss = F.cross_entropy(logits.transpose(1, 2), target_tokens, reduction="none")
+      with torch.amp.autocast("cuda", enabled=use_amp):
+        logits, _ = model(input_tokens)
+        per_token_loss = F.cross_entropy(logits.transpose(1, 2), target_tokens, reduction="none")
+
       batch_loss = (per_token_loss * token_mask).sum()
       batch_tokens = token_mask.sum()
 
@@ -118,7 +129,7 @@ def save_checkpoint(model: PicoRouter, config: PicoConfig, step: int, tag: str |
 
 def train(
   epochs: int = 3,
-  batch_size: int = 64,
+  batch_size: int = 16,
   peak_lr: float = 3e-4,
   min_lr: float = 3e-5,
   warmup_steps: int = 2000,
@@ -155,7 +166,7 @@ def train(
 
   print(f"  Model: {num_params:,} parameters ({num_params / 1e6:.1f}M)")
 
-  steps_per_epoch = math.ceil(num_train_examples / batch_size)
+  steps_per_epoch = num_train_examples // batch_size
   total_steps = steps_per_epoch * epochs
 
   print(f"  {steps_per_epoch:,} steps/epoch x {epochs} epochs = {total_steps:,} total steps")
@@ -179,6 +190,26 @@ def train(
     optimizer, schedulers=[warmup_scheduler, decay_scheduler], milestones=[warmup_steps]
   )
 
+  use_amp = device.type == "cuda"
+  scaler = torch.amp.GradScaler(enabled=use_amp)
+
+  train_dataset = TokenDataset(train_ids, train_mask)
+
+  train_loader = DataLoader(
+    train_dataset,
+    batch_size=batch_size,
+    shuffle=True,
+    num_workers=2,
+    pin_memory=use_amp,
+    drop_last=True,
+    persistent_workers=True,
+  )
+
+  raw_model = model
+
+  if device.type == "cuda":
+    model = torch.compile(model)
+
   CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
   print(f"\nTraining for {total_steps:,} steps  (bs={batch_size}, peak_lr={peak_lr})")
@@ -186,43 +217,40 @@ def train(
 
   global_step = 0
   start_time = time.time()
-  epoch_indices = list(range(num_train_examples))
 
   model.train()
 
   with open(LOG_PATH, "w") as log_file:
     for epoch in range(1, epochs + 1):
-      random.shuffle(epoch_indices)
-
       print(f"\n--- Epoch {epoch}/{epochs} ---")
 
-      for batch_start in range(0, num_train_examples, batch_size):
+      for input_tokens, target_tokens, token_mask in train_loader:
         if _interrupted:
-          save_checkpoint(model, config, global_step, tag=f"interrupted-step-{global_step}")
+          save_checkpoint(raw_model, config, global_step, tag=f"interrupted-step-{global_step}")
           print("Training interrupted. Checkpoint saved.")
           return
 
         global_step += 1
-        batch_indices = epoch_indices[batch_start : batch_start + batch_size]
 
-        if len(batch_indices) < 2:
-          continue
+        input_tokens = input_tokens.to(device, non_blocking=True)
+        target_tokens = target_tokens.to(device, non_blocking=True)
+        token_mask = token_mask.to(device, non_blocking=True)
 
-        batch_ids = train_ids[batch_indices]
-        batch_mask_np = train_mask[batch_indices]
-
-        input_tokens = torch.tensor(batch_ids[:, :-1], dtype=torch.long, device=device)
-        target_tokens = torch.tensor(batch_ids[:, 1:], dtype=torch.long, device=device)
-        token_mask = torch.tensor(batch_mask_np[:, 1:], dtype=torch.float32, device=device)
-
-        logits, _ = model(input_tokens)
-        per_token_loss = F.cross_entropy(logits.transpose(1, 2), target_tokens, reduction="none")
-        loss = (per_token_loss * token_mask).sum() / token_mask.sum()
+        with torch.amp.autocast("cuda", enabled=use_amp):
+          logits, _ = model(input_tokens)
+          per_token_loss = F.cross_entropy(logits.transpose(1, 2), target_tokens, reduction="none")
+          loss = (per_token_loss * token_mask).sum() / token_mask.sum()
 
         optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+
         gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-        optimizer.step()
+
+        scaler.step(optimizer)
+
+        scaler.update()
+
         scheduler.step()
 
         current_lr = scheduler.get_last_lr()[0]
@@ -242,7 +270,7 @@ def train(
           )
 
         if global_step % val_every == 0:
-          val_loss = compute_val_loss(model, val_ids, val_mask, batch_size, device)
+          val_loss = compute_val_loss(model, val_ids, val_mask, batch_size, device, use_amp=use_amp)
           model.train()
           print(f"  >>> val_loss={val_loss:.4f} (step {global_step})")
         else:
@@ -263,20 +291,21 @@ def train(
         log_file.flush()
 
         if global_step % checkpoint_every == 0:
-          save_checkpoint(model, config, global_step)
+          save_checkpoint(raw_model, config, global_step)
 
-    save_checkpoint(model, config, global_step, tag=f"final-step-{global_step}")
+    save_checkpoint(raw_model, config, global_step, tag=f"final-step-{global_step}")
 
   elapsed = time.time() - start_time
 
   print("=" * 70)
+
   print(f"Training complete — {global_step:,} steps in {elapsed / 3600:.1f}h")
 
 
 def main():
   parser = argparse.ArgumentParser(description="Train PicoRouter")
   parser.add_argument("--epochs", type=int, default=3)
-  parser.add_argument("--batch-size", type=int, default=64)
+  parser.add_argument("--batch-size", type=int, default=16)
   parser.add_argument("--peak-lr", type=float, default=3e-4)
   parser.add_argument("--min-lr", type=float, default=3e-5)
   parser.add_argument("--warmup-steps", type=int, default=2000)
@@ -287,6 +316,7 @@ def main():
   parser.add_argument("--log-every", type=int, default=100)
   parser.add_argument("--seed", type=int, default=42)
   parser.add_argument("--device", type=str, default=None, help="Force device (cuda, mps, cpu)")
+
   args = parser.parse_args()
 
   train(
