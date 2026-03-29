@@ -32,7 +32,7 @@ Is this message a question, a command, a refusal case? A small fast model that r
 
 Given a context and a question, should the system answer or refuse? PicoRouter has explicit training for this (SQuAD2 unanswerable questions, the `<|refuse|>` token) and can serve as a lightweight gate that runs before a more expensive model.
 
-### The design pattern: Small model as a component, not a standalone
+### The Design Pattern: Small model as a component, not a standalone
 
 ```
 User query
