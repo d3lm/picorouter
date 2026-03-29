@@ -1,4 +1,4 @@
-"""Production training loop for PicoRouter using MLX."""
+"""Production training loop for PicoRouter using PyTorch."""
 
 import argparse
 import json
@@ -8,13 +8,12 @@ import signal
 import time
 from pathlib import Path
 
-import mlx.core as mx
-import mlx.nn as nn
-import mlx.optimizers as optim
-import mlx.utils
 import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset
 
-from model.architecture import PicoConfig, PicoRouter, count_params_flat
+from model.architecture import PicoConfig, PicoRouter
 
 CHECKPOINT_DIR = Path(__file__).parent / "checkpoints"
 DATA_DIR = Path(__file__).resolve().parents[1] / "data" / "processed"
@@ -29,6 +28,35 @@ def _handle_signal(signum, _frame):
   print(f"\n[signal {signum}] Graceful shutdown requested, saving checkpoint...")
 
 
+def get_device(override: str | None = None) -> torch.device:
+  if override:
+    return torch.device(override)
+  if torch.cuda.is_available():
+    return torch.device("cuda")
+  if torch.backends.mps.is_available():
+    return torch.device("mps")
+  return torch.device("cpu")
+
+
+class TokenDataset(Dataset):
+  """Wraps pre-tokenized numpy arrays as a PyTorch Dataset."""
+
+  def __init__(self, input_ids: np.ndarray, loss_mask: np.ndarray):
+    self.input_ids = input_ids
+    self.loss_mask = loss_mask
+
+  def __len__(self):
+    return len(self.input_ids)
+
+  def __getitem__(self, idx):
+    ids = self.input_ids[idx]
+    mask = self.loss_mask[idx]
+    input_tokens = torch.tensor(ids[:-1], dtype=torch.long)
+    target_tokens = torch.tensor(ids[1:], dtype=torch.long)
+    token_mask = torch.tensor(mask[1:], dtype=torch.float32)
+    return input_tokens, target_tokens, token_mask
+
+
 def load_npz_split(name: str) -> tuple[np.ndarray, np.ndarray]:
   """Load a pre-tokenized .npz split (memory-mapped for large files)."""
   path = DATA_DIR / f"{name}.npz"
@@ -36,52 +64,41 @@ def load_npz_split(name: str) -> tuple[np.ndarray, np.ndarray]:
   return data["input_ids"], data["loss_mask"]
 
 
-def collate_batch_npz(
-  input_ids: np.ndarray,
-  loss_mask: np.ndarray,
-  indices: list[int],
-) -> tuple[mx.array, mx.array, mx.array]:
-  """Build input/target/mask tensors from pre-tokenized, pre-padded data."""
-  batch_ids = input_ids[indices]
-  batch_mask = loss_mask[indices]
-
-  input_tokens = mx.array(batch_ids[:, :-1], dtype=mx.int32)
-  target_tokens = mx.array(batch_ids[:, 1:], dtype=mx.int32)
-  token_mask = mx.array(batch_mask[:, 1:], dtype=mx.float32)
-
-  return input_tokens, target_tokens, token_mask
-
-
-def loss_fn(model: PicoRouter, inputs: mx.array, targets: mx.array, loss_mask: mx.array) -> mx.array:
-  logits, _ = model(inputs)
-  per_token_loss = nn.losses.cross_entropy(logits, targets, reduction="none")
-  return (per_token_loss * loss_mask).sum() / loss_mask.sum()
-
-
 def compute_val_loss(
   model: PicoRouter,
   val_ids: np.ndarray,
   val_mask: np.ndarray,
   batch_size: int,
+  device: torch.device,
   max_examples: int = 2048,
 ) -> float:
   """Compute average validation loss on a random subset."""
+  model.eval()
   num_examples = min(len(val_ids), max_examples)
   indices = random.sample(range(len(val_ids)), num_examples)
 
   total_loss = 0.0
   total_tokens = 0
 
-  for i in range(0, num_examples, batch_size):
-    batch_indices = indices[i : i + batch_size]
-    input_tokens, target_tokens, token_mask = collate_batch_npz(val_ids, val_mask, batch_indices)
-    logits, _ = model(input_tokens)
-    per_token_loss = nn.losses.cross_entropy(logits, target_tokens, reduction="none")
-    batch_loss = (per_token_loss * token_mask).sum()
-    batch_tokens = token_mask.sum()
-    mx.eval(batch_loss, batch_tokens)
-    total_loss += batch_loss.item()
-    total_tokens += batch_tokens.item()
+  with torch.no_grad():
+    for i in range(0, num_examples, batch_size):
+      batch_indices = indices[i : i + batch_size]
+      batch_ids = val_ids[batch_indices]
+      batch_mask_np = val_mask[batch_indices]
+
+      input_tokens = torch.tensor(batch_ids[:, :-1], dtype=torch.long, device=device)
+      target_tokens = torch.tensor(batch_ids[:, 1:], dtype=torch.long, device=device)
+      token_mask = torch.tensor(batch_mask_np[:, 1:], dtype=torch.float32, device=device)
+
+      logits, _ = model(input_tokens)
+      per_token_loss = F.cross_entropy(logits.transpose(1, 2), target_tokens, reduction="none")
+      batch_loss = (per_token_loss * token_mask).sum()
+      batch_tokens = token_mask.sum()
+
+      total_loss += batch_loss.item()
+      total_tokens += batch_tokens.item()
+
+  model.train()
 
   return total_loss / max(total_tokens, 1)
 
@@ -91,8 +108,7 @@ def save_checkpoint(model: PicoRouter, config: PicoConfig, step: int, tag: str |
   ckpt_dir = CHECKPOINT_DIR / name
   ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-  flat_params = dict(mlx.utils.tree_flatten(model.parameters()))
-  mx.savez(str(ckpt_dir / "weights.npz"), **flat_params)
+  torch.save(model.state_dict(), ckpt_dir / "weights.pt")
 
   with open(ckpt_dir / "config.json", "w") as f:
     json.dump(config.__dict__, f, indent=2)
@@ -112,21 +128,30 @@ def train(
   val_every: int = 500,
   log_every: int = 100,
   seed: int = 42,
+  device_override: str | None = None,
 ):
   random.seed(seed)
+
+  torch.manual_seed(seed)
+
+  device = get_device(device_override)
+
+  print(f"Using device: {device}")
 
   signal.signal(signal.SIGINT, _handle_signal)
   signal.signal(signal.SIGTERM, _handle_signal)
 
   print("Loading data...")
+
   train_ids, train_mask = load_npz_split("train")
   val_ids, val_mask = load_npz_split("val")
   num_train_examples = len(train_ids)
+
   print(f"  Train: {num_train_examples:,} examples | Val: {len(val_ids):,} examples")
 
   config = PicoConfig()
-  model = PicoRouter(config)
-  num_params = count_params_flat(model)
+  model = PicoRouter(config).to(device)
+  num_params = sum(p.numel() for p in model.parameters())
 
   print(f"  Model: {num_params:,} parameters ({num_params / 1e6:.1f}M)")
 
@@ -135,17 +160,24 @@ def train(
 
   print(f"  {steps_per_epoch:,} steps/epoch x {epochs} epochs = {total_steps:,} total steps")
 
-  warmup = optim.linear_schedule(0.0, peak_lr, steps=warmup_steps)
-  decay = optim.cosine_decay(peak_lr, total_steps - warmup_steps, min_lr)
-  lr_schedule = optim.join_schedules([warmup, decay], [warmup_steps])
-
-  optimizer = optim.AdamW(
-    learning_rate=lr_schedule,
+  optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=peak_lr,
+    betas=(0.9, 0.95),
     weight_decay=weight_decay,
-    betas=[0.9, 0.95],
   )
 
-  loss_and_grad = nn.value_and_grad(model, loss_fn)
+  warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+    optimizer, start_factor=1e-8 / peak_lr, end_factor=1.0, total_iters=warmup_steps
+  )
+
+  decay_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer, T_max=total_steps - warmup_steps, eta_min=min_lr
+  )
+
+  scheduler = torch.optim.lr_scheduler.SequentialLR(
+    optimizer, schedulers=[warmup_scheduler, decay_scheduler], milestones=[warmup_steps]
+  )
 
   CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -156,9 +188,12 @@ def train(
   start_time = time.time()
   epoch_indices = list(range(num_train_examples))
 
+  model.train()
+
   with open(LOG_PATH, "w") as log_file:
     for epoch in range(1, epochs + 1):
       random.shuffle(epoch_indices)
+
       print(f"\n--- Epoch {epoch}/{epochs} ---")
 
       for batch_start in range(0, num_train_examples, batch_size):
@@ -173,15 +208,24 @@ def train(
         if len(batch_indices) < 2:
           continue
 
-        input_tokens, target_tokens, token_mask = collate_batch_npz(train_ids, train_mask, batch_indices)
+        batch_ids = train_ids[batch_indices]
+        batch_mask_np = train_mask[batch_indices]
 
-        loss, gradients = loss_and_grad(model, input_tokens, target_tokens, token_mask)
-        gradients, gradient_norm = optim.clip_grad_norm(gradients, max_norm=max_grad_norm)
-        optimizer.update(model, gradients)
+        input_tokens = torch.tensor(batch_ids[:, :-1], dtype=torch.long, device=device)
+        target_tokens = torch.tensor(batch_ids[:, 1:], dtype=torch.long, device=device)
+        token_mask = torch.tensor(batch_mask_np[:, 1:], dtype=torch.float32, device=device)
 
-        mx.eval(model.parameters(), optimizer.state, loss, gradient_norm)
+        logits, _ = model(input_tokens)
+        per_token_loss = F.cross_entropy(logits.transpose(1, 2), target_tokens, reduction="none")
+        loss = (per_token_loss * token_mask).sum() / token_mask.sum()
 
-        current_lr = optimizer.learning_rate.item()
+        optimizer.zero_grad()
+        loss.backward()
+        gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        optimizer.step()
+        scheduler.step()
+
+        current_lr = scheduler.get_last_lr()[0]
         train_loss = loss.item()
 
         if global_step % log_every == 0 or global_step == 1:
@@ -198,7 +242,8 @@ def train(
           )
 
         if global_step % val_every == 0:
-          val_loss = compute_val_loss(model, val_ids, val_mask, batch_size)
+          val_loss = compute_val_loss(model, val_ids, val_mask, batch_size, device)
+          model.train()
           print(f"  >>> val_loss={val_loss:.4f} (step {global_step})")
         else:
           val_loss = None
@@ -241,6 +286,7 @@ def main():
   parser.add_argument("--val-every", type=int, default=500)
   parser.add_argument("--log-every", type=int, default=100)
   parser.add_argument("--seed", type=int, default=42)
+  parser.add_argument("--device", type=str, default=None, help="Force device (cuda, mps, cpu)")
   args = parser.parse_args()
 
   train(
@@ -255,6 +301,7 @@ def main():
     val_every=args.val_every,
     log_every=args.log_every,
     seed=args.seed,
+    device_override=args.device,
   )
 
 

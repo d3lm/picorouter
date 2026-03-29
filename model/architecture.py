@@ -1,10 +1,10 @@
-"""LLaMA-style 12M-parameter decoder-only transformer in MLX."""
+"""LLaMA-style 12M-parameter decoder-only transformer in PyTorch."""
 
 from dataclasses import dataclass
 
-import mlx.core as mx
-import mlx.nn as nn
-from mlx.core import array
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 @dataclass
@@ -21,40 +21,34 @@ class PicoConfig:
 class RMSNorm(nn.Module):
   def __init__(self, dim: int, eps: float = 1e-6):
     super().__init__()
-    self.weight = mx.ones((dim,))
+    self.weight = nn.Parameter(torch.ones(dim))
     self.eps = eps
 
-  def __call__(self, x: mx.array) -> mx.array:
-    norm = mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + self.eps)
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
     return x * norm * self.weight
 
 
-def precompute_rope_frequencies(dim: int, max_seq_len: int, theta: float = 10000.0) -> tuple[mx.array, mx.array]:
-  freqs = 1.0 / (theta ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim))
-  t = mx.arange(max_seq_len, dtype=mx.float32)
-  angles = mx.expand_dims(t, 1) * mx.expand_dims(freqs, 0)
-  return mx.cos(angles), mx.sin(angles)
-
-
-def apply_rope(x: mx.array, cos_freq: mx.array, sin_freq: mx.array, offset: int = 0) -> mx.array:
-  seq_len = x.shape[1]
-  cos_f = cos_freq[offset : offset + seq_len]
-  sin_f = sin_freq[offset : offset + seq_len]
-
-  cos_f = mx.expand_dims(mx.expand_dims(cos_f, 0), 2)
-  sin_f = mx.expand_dims(mx.expand_dims(sin_f, 0), 2)
+def apply_rope(
+  x: torch.Tensor,
+  cos_freq: torch.Tensor,
+  sin_freq: torch.Tensor,
+  offset: int = 0,
+) -> torch.Tensor:
+  seq_len = x.shape[2]
+  cos_f = cos_freq[offset : offset + seq_len].unsqueeze(0).unsqueeze(1)
+  sin_f = sin_freq[offset : offset + seq_len].unsqueeze(0).unsqueeze(1)
 
   x1 = x[..., ::2]
   x2 = x[..., 1::2]
 
-  rotated = mx.concatenate([x1 * cos_f - x2 * sin_f, x1 * sin_f + x2 * cos_f], axis=-1)
-
-  return rotated
+  return torch.cat([x1 * cos_f - x2 * sin_f, x1 * sin_f + x2 * cos_f], dim=-1)
 
 
 class Attention(nn.Module):
   def __init__(self, config: PicoConfig):
     super().__init__()
+
     self.num_heads = config.num_heads
     self.head_dim = config.hidden_dim // config.num_heads
 
@@ -63,19 +57,19 @@ class Attention(nn.Module):
     self.v_proj = nn.Linear(config.hidden_dim, config.hidden_dim, bias=False)
     self.o_proj = nn.Linear(config.hidden_dim, config.hidden_dim, bias=False)
 
-  def __call__(
+  def forward(
     self,
-    x: mx.array,
-    cos_freq: mx.array,
-    sin_freq: mx.array,
-    mask: mx.array | None = None,
-    cache: tuple[mx.array, mx.array] | None = None,
-  ) -> tuple[mx.array, tuple[mx.array, mx.array]]:
+    x: torch.Tensor,
+    cos_freq: torch.Tensor,
+    sin_freq: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+  ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     B, L, _ = x.shape
 
-    q = self.q_proj(x).reshape(B, L, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-    k = self.k_proj(x).reshape(B, L, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-    v = self.v_proj(x).reshape(B, L, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+    q = self.q_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+    k = self.k_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+    v = self.v_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
 
     offset = 0
 
@@ -86,19 +80,19 @@ class Attention(nn.Module):
     k = apply_rope(k, cos_freq, sin_freq, offset)
 
     if cache is not None:
-      k = mx.concatenate([cache[0], k], axis=2)
-      v = mx.concatenate([cache[1], v], axis=2)
+      k = torch.cat([cache[0], k], dim=2)
+      v = torch.cat([cache[1], v], dim=2)
 
     new_cache = (k, v)
 
     scale = self.head_dim**-0.5
-    attn = (q @ k.transpose(0, 1, 3, 2)) * scale
+    attn = (q @ k.transpose(-2, -1)) * scale
 
     if mask is not None:
       attn = attn + mask
 
-    attn = mx.softmax(attn, axis=-1)
-    out = (attn @ v).transpose(0, 2, 1, 3).reshape(B, L, -1)
+    attn = F.softmax(attn, dim=-1)
+    out = (attn @ v).transpose(1, 2).reshape(B, L, -1)
 
     return self.o_proj(out), new_cache
 
@@ -110,8 +104,8 @@ class SwiGLUFFN(nn.Module):
     self.up_proj = nn.Linear(config.hidden_dim, config.ffn_dim, bias=False)
     self.down_proj = nn.Linear(config.ffn_dim, config.hidden_dim, bias=False)
 
-  def __call__(self, x: mx.array) -> mx.array:
-    return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class TransformerBlock(nn.Module):
@@ -122,14 +116,14 @@ class TransformerBlock(nn.Module):
     self.attn_norm = RMSNorm(config.hidden_dim)
     self.ffn_norm = RMSNorm(config.hidden_dim)
 
-  def __call__(
+  def forward(
     self,
-    x: mx.array,
-    cos_freq: mx.array,
-    sin_freq: mx.array,
-    mask: mx.array | None = None,
-    cache: tuple[mx.array, mx.array] | None = None,
-  ) -> tuple[mx.array, tuple[mx.array, mx.array]]:
+    x: torch.Tensor,
+    cos_freq: torch.Tensor,
+    sin_freq: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+  ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     h, new_cache = self.attention(self.attn_norm(x), cos_freq, sin_freq, mask, cache)
     x = x + h
     x = x + self.ffn(self.ffn_norm(x))
@@ -141,28 +135,27 @@ class PicoRouter(nn.Module):
     super().__init__()
     self.config = config
     self.embed = nn.Embedding(config.vocab_size, config.hidden_dim)
-    self.layers = [TransformerBlock(config) for _ in range(config.num_layers)]
+    self.layers = nn.ModuleList([TransformerBlock(config) for _ in range(config.num_layers)])
     self.norm = RMSNorm(config.hidden_dim)
 
-    cos_freq, sin_freq = precompute_rope_frequencies(
-      config.hidden_dim // config.num_heads,
-      config.max_seq_len,
-      config.rope_theta,
-    )
+    head_dim = config.hidden_dim // config.num_heads
+    freqs = 1.0 / (config.rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+    t = torch.arange(config.max_seq_len, dtype=torch.float32)
+    angles = t.unsqueeze(1) * freqs.unsqueeze(0)
+    self.register_buffer("_cos_freq", torch.cos(angles))
+    self.register_buffer("_sin_freq", torch.sin(angles))
 
-    self._cos_freq = cos_freq
-    self._sin_freq = sin_freq
-
-  def __call__(
+  def forward(
     self,
-    token_ids: mx.array,
-    cache: list[tuple[mx.array, mx.array]] | None = None,
-  ) -> tuple[mx.array, list[tuple[mx.array, mx.array]]]:
+    token_ids: torch.Tensor,
+    cache: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+  ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
     _B, L = token_ids.shape
     x = self.embed(token_ids)
 
     if cache is None:
-      mask = nn.MultiHeadAttention.create_additive_causal_mask(L).astype(x.dtype)
+      mask = torch.triu(torch.full((L, L), float("-inf"), device=x.device), diagonal=1)
+      mask = mask.unsqueeze(0).unsqueeze(0)
       cache = [None] * self.config.num_layers
     else:
       mask = None
@@ -180,46 +173,18 @@ class PicoRouter(nn.Module):
     return logits, new_cache
 
 
-def count_parameters(model: PicoRouter) -> int:
-  total = 0
-  for _name, param in model.parameters().items():
-    if isinstance(param, mx.array):
-      total += param.size
-    elif isinstance(param, dict):
-      for v in param.values():
-        if isinstance(v, mx.array):
-          total += v.size
-    elif isinstance(param, list):
-      for item in param:
-        if isinstance(item, mx.array):
-          total += item.size
-        elif isinstance(item, dict):
-          for v in item.values():
-            if isinstance(v, mx.array):
-              total += v.size
-  return total
-
-
-def count_params_flat(model: PicoRouter) -> int:
-  """Count parameters using the flat leaf structure from tree_flatten."""
-  import mlx.utils
-
-  leaves = mlx.utils.tree_flatten(model.parameters())
-  return sum(p.size for _, p in leaves)
-
-
 if __name__ == "__main__":
   config = PicoConfig()
   model = PicoRouter(config)
 
-  n_params = count_params_flat(model)
+  num_params = sum(p.numel() for p in model.parameters())
 
   print("PicoRouter model instantiated")
   print(f"  Config: {config}")
-  print(f"  Parameters: {n_params:,} ({n_params / 1e6:.1f}M)")
+  print(f"  Parameters: {num_params:,} ({num_params / 1e6:.1f}M)")
 
-  dummy_input = mx.array([[1, 2, 3, 4, 5]])
-  logits, _ = model[array | list[tuple[array, array]], ...](dummy_input)
+  dummy_input = torch.tensor([[1, 2, 3, 4, 5]])
+  logits, _ = model(dummy_input)
 
   print(f"  Input shape:  {dummy_input.shape}")
   print(f"  Output shape: {logits.shape}")

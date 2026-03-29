@@ -16,7 +16,7 @@ import string
 import time
 from pathlib import Path
 
-import mlx.core as mx
+import torch
 
 from model.architecture import PicoConfig, PicoRouter
 from model.tokenizer import encode_example, load_tokenizer
@@ -29,35 +29,46 @@ EVAL_REPORT_PATH = Path(__file__).parent / "eval_report.json"
 REFUSAL_PHRASE = "I don't have enough information"
 
 
-def load_model(checkpoint_dir: Path) -> tuple[PicoRouter, PicoConfig]:
+def get_device(override: str | None = None) -> torch.device:
+  if override:
+    return torch.device(override)
+  if torch.cuda.is_available():
+    return torch.device("cuda")
+  if torch.backends.mps.is_available():
+    return torch.device("mps")
+  return torch.device("cpu")
+
+
+def load_model(checkpoint_dir: Path, device: torch.device) -> tuple[PicoRouter, PicoConfig]:
   with open(checkpoint_dir / "config.json") as config_file:
     cfg = PicoConfig(**json.load(config_file))
 
-  model = PicoRouter(cfg)
-  weights = mx.load(str(checkpoint_dir / "weights.npz"))
-  model.load_weights(list(weights.items()))
+  model = PicoRouter(cfg).to(device)
 
-  mx.eval(model.parameters())
+  weights_path = checkpoint_dir / "weights.pt"
+  state_dict = torch.load(weights_path, map_location=device, weights_only=True)
+  model.load_state_dict(state_dict)
+  model.eval()
 
   return model, cfg
 
 
+@torch.no_grad()
 def generate(
   model: PicoRouter,
   token_ids: list[int],
   eos_id: int,
+  device: torch.device,
   max_new_tokens: int = 256,
 ) -> list[int]:
   """Greedy autoregressive generation with KV-cache."""
   generated = []
   cache = None
-  input_ids = mx.array([token_ids], dtype=mx.int32)
+  input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
 
   for _ in range(max_new_tokens):
     logits, cache = model(input_ids, cache)
-    next_token = mx.argmax(logits[:, -1, :], axis=-1)
-
-    mx.eval(next_token)
+    next_token = torch.argmax(logits[:, -1, :], dim=-1)
 
     tid = next_token.item()
 
@@ -66,7 +77,7 @@ def generate(
 
     generated.append(tid)
 
-    input_ids = mx.array([[tid]], dtype=mx.int32)
+    input_ids = torch.tensor([[tid]], dtype=torch.long, device=device)
 
   return generated
 
@@ -205,6 +216,7 @@ def eval_extractive(
   model: PicoRouter,
   tokenizer,
   examples: list[dict],
+  device: torch.device,
   max_examples: int = 2000,
 ) -> dict:
   eos_id = tokenizer.token_to_id("<|eos|>")
@@ -213,7 +225,7 @@ def eval_extractive(
 
   for ex in subset:
     prompt = build_prompt_tokens(tokenizer, ex)
-    gen_ids = generate(model, prompt, eos_id)
+    gen_ids = generate(model, prompt, eos_id, device)
     prediction = tokenizer.decode(gen_ids)
     gold = get_gold_answer(ex)
     f1, em = token_f1(prediction, gold)
@@ -275,6 +287,7 @@ def eval_tool_accuracy(
   tokenizer,
   tool_examples: list[dict],
   rc_examples: list[dict],
+  device: torch.device,
   max_examples: int = 2000,
 ) -> dict:
   eos_id = tokenizer.token_to_id("<|eos|>")
@@ -287,7 +300,7 @@ def eval_tool_accuracy(
 
   for ex in tool_subset:
     prompt = build_prompt_tokens(tokenizer, ex)
-    gen_ids = generate(model, prompt, eos_id)
+    gen_ids = generate(model, prompt, eos_id, device)
     prediction = tokenizer.decode(gen_ids)
     gold = get_gold_answer(ex)
 
@@ -312,7 +325,7 @@ def eval_tool_accuracy(
 
   for ex in rc_subset:
     prompt = build_prompt_tokens(tokenizer, ex)
-    gen_ids = generate(model, prompt, eos_id)
+    gen_ids = generate(model, prompt, eos_id, device)
 
     prediction = tokenizer.decode(gen_ids)
 
@@ -336,6 +349,7 @@ def eval_refusal(
   tokenizer,
   refusal_examples: list[dict],
   rc_examples: list[dict],
+  device: torch.device,
   max_examples: int = 2000,
 ) -> dict:
   eos_id = tokenizer.token_to_id("<|eos|>")
@@ -346,7 +360,7 @@ def eval_refusal(
 
   for ex in refusal_subset:
     prompt = build_prompt_tokens(tokenizer, ex)
-    gen_ids = generate(model, prompt, eos_id)
+    gen_ids = generate(model, prompt, eos_id, device)
 
     prediction = tokenizer.decode(gen_ids)
 
@@ -358,7 +372,7 @@ def eval_refusal(
 
   for ex in rc_subset:
     prompt = build_prompt_tokens(tokenizer, ex)
-    gen_ids = generate(model, prompt, eos_id)
+    gen_ids = generate(model, prompt, eos_id, device)
 
     prediction = tokenizer.decode(gen_ids)
 
@@ -420,6 +434,7 @@ def eval_hallucination(
   model: PicoRouter,
   tokenizer,
   all_examples: list[dict],
+  device: torch.device,
   n_probes: int = 500,
 ) -> dict:
   eos_id = tokenizer.token_to_id("<|eos|>")
@@ -430,7 +445,7 @@ def eval_hallucination(
 
   for ex in adversarial:
     prompt = build_prompt_tokens(tokenizer, ex)
-    gen_ids = generate(model, prompt, eos_id)
+    gen_ids = generate(model, prompt, eos_id, device)
     prediction = tokenizer.decode(gen_ids)
 
     is_refusal = REFUSAL_PHRASE.lower() in prediction.lower() or refuse_id in gen_ids
@@ -446,9 +461,17 @@ def eval_hallucination(
   }
 
 
+def _sync_device(device: torch.device):
+  """Ensure all pending GPU/MPS work completes for accurate timing."""
+  if device.type == "cuda":
+    torch.cuda.synchronize()
+
+
+@torch.no_grad()
 def eval_latency(
   model: PicoRouter,
   tokenizer,
+  device: torch.device,
   context_lengths: list[int] | None = None,
   gen_tokens: int = 64,
   n_trials: int = 5,
@@ -470,22 +493,20 @@ def eval_latency(
 
     for _ in range(n_trials):
       cache = None
-      input_ids = mx.array([prompt], dtype=mx.int32)
+      input_ids = torch.tensor([prompt], dtype=torch.long, device=device)
 
+      _sync_device(device)
       t0 = time.perf_counter()
 
       logits, cache = model(input_ids, cache)
+      first_token = torch.argmax(logits[:, -1, :], dim=-1)
 
-      first_token = mx.argmax(logits[:, -1, :], axis=-1)
-
-      mx.eval(first_token)
-
+      _sync_device(device)
       ttft = time.perf_counter() - t0
 
       ttfts.append(ttft)
 
       generated = 0
-
       t_gen_start = time.perf_counter()
 
       tid = first_token.item()
@@ -494,17 +515,14 @@ def eval_latency(
         if tid == eos_id:
           break
 
-        input_ids = mx.array([[tid]], dtype=mx.int32)
+        input_ids = torch.tensor([[tid]], dtype=torch.long, device=device)
         logits, cache = model(input_ids, cache)
-
-        next_token = mx.argmax(logits[:, -1, :], axis=-1)
-
-        mx.eval(next_token)
+        next_token = torch.argmax(logits[:, -1, :], dim=-1)
 
         tid = next_token.item()
-
         generated += 1
 
+      _sync_device(device)
       t_gen_end = time.perf_counter()
       gen_elapsed = t_gen_end - t_gen_start
       if generated > 0 and gen_elapsed > 0:
@@ -522,7 +540,7 @@ def eval_latency(
 
 
 def find_checkpoints() -> list[Path]:
-  """Find all step-* checkpoint directories."""
+  """Find all checkpoint directories with weights.pt and config.json."""
   if not CHECKPOINT_DIR.exists():
     return []
 
@@ -530,9 +548,7 @@ def find_checkpoints() -> list[Path]:
 
   for checkpoint_dir in sorted(CHECKPOINT_DIR.iterdir()):
     if (
-      checkpoint_dir.is_dir()
-      and (checkpoint_dir / "weights.npz").exists()
-      and (checkpoint_dir / "config.json").exists()
+      checkpoint_dir.is_dir() and (checkpoint_dir / "weights.pt").exists() and (checkpoint_dir / "config.json").exists()
     ):
       checkpoints.append(checkpoint_dir)
 
@@ -555,6 +571,7 @@ def select_best_checkpoint(reports: dict[str, dict]) -> str | None:
 
 def run_evaluation(
   checkpoint_dir: Path,
+  device: torch.device,
   max_rc: int = 2000,
   max_tool: int = 2000,
   max_refusal: int = 2000,
@@ -562,7 +579,7 @@ def run_evaluation(
   skip_latency: bool = False,
 ) -> dict:
   print(f"\nLoading checkpoint: {checkpoint_dir}")
-  model, _ = load_model(checkpoint_dir)
+  model, _ = load_model(checkpoint_dir, device)
 
   tokenizer = load_tokenizer()
 
@@ -577,34 +594,34 @@ def run_evaluation(
 
   print("\n[1/5] Extractive F1 / Exact Match...")
 
-  report["extractive"] = eval_extractive(model, tokenizer, groups["rc"], max_rc)
+  report["extractive"] = eval_extractive(model, tokenizer, groups["rc"], device, max_rc)
 
   print(f"       F1={report['extractive']['mean_f1']}  EM={report['extractive']['mean_em']}")
 
   print("\n[2/5] Tool-call accuracy...")
 
-  report["tool_calling"] = eval_tool_accuracy(model, tokenizer, groups["tool"], groups["rc"], max_tool)
+  report["tool_calling"] = eval_tool_accuracy(model, tokenizer, groups["tool"], groups["rc"], device, max_tool)
   tc = report["tool_calling"]
 
   print(f"       Routing={tc['routing_accuracy']}  Name={tc['name_accuracy']}  Full={tc['full_match_accuracy']}")
 
   print("\n[3/5] Refusal rate...")
 
-  report["refusal"] = eval_refusal(model, tokenizer, groups["refusal"], groups["rc"], max_refusal)
+  report["refusal"] = eval_refusal(model, tokenizer, groups["refusal"], groups["rc"], device, max_refusal)
   ref = report["refusal"]
 
   print(f"       Correct={ref['correct_refusal_rate']}  FalseRefusal={ref['false_refusal_rate']}")
 
   print("\n[4/5] Hallucination probe...")
 
-  report["hallucination"] = eval_hallucination(model, tokenizer, all_test, n_hallucination)
+  report["hallucination"] = eval_hallucination(model, tokenizer, all_test, device, n_hallucination)
 
   print(f"       Rate={report['hallucination']['hallucination_rate']}")
 
   if not skip_latency:
     print("\n[5/5] Latency benchmark...")
 
-    report["latency"] = eval_latency(model, tokenizer)
+    report["latency"] = eval_latency(model, tokenizer, device)
 
     for k, v in report["latency"].items():
       print(f"       {k}: TTFT={v['ttft_ms']}ms  {v['tok_per_sec']} tok/s")
@@ -648,7 +665,8 @@ def run_evaluation(
   if "latency" in report:
     print()
 
-    print("Latency (MLX, Apple Silicon):")
+    device_label = str(device).upper()
+    print(f"Latency ({device_label}):")
 
     for k, v in report["latency"].items():
       ctx = k.replace("context_", "")
@@ -675,13 +693,18 @@ def main():
   parser.add_argument("--max-refusal", type=int, default=2000)
   parser.add_argument("--n-hallucination", type=int, default=500)
   parser.add_argument("--skip-latency", action="store_true")
+  parser.add_argument("--device", type=str, default=None, help="Force device (cuda, mps, cpu)")
   args = parser.parse_args()
+
+  device = get_device(args.device)
+  print(f"Using device: {device}")
 
   if args.checkpoint:
     checkpoint_dir = Path(args.checkpoint)
 
     report = run_evaluation(
       checkpoint_dir,
+      device,
       max_rc=args.max_rc,
       max_tool=args.max_tool,
       max_refusal=args.max_refusal,
@@ -709,6 +732,7 @@ def main():
     for checkpoint_dir in to_eval:
       report = run_evaluation(
         checkpoint_dir,
+        device,
         max_rc=args.max_rc,
         max_tool=args.max_tool,
         max_refusal=args.max_refusal,
