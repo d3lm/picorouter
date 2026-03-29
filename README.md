@@ -99,7 +99,7 @@ uv run python -m model.evaluate --checkpoint model/checkpoints/step-9000
 uv run python -m model.evaluate --skip-latency
 ```
 
-### Export & misc
+### Export & Misc
 
 ```bash
 # Export to ONNX
