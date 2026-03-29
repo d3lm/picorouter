@@ -26,5 +26,5 @@ data/synthetic/
 processed/
 !processed/seed.jsonl
 
-playground/
+playgrounds/
 tasks/
