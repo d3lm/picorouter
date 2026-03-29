@@ -1,6 +1,6 @@
 # PicoRouter
 
-A ~12M parameter "amnesiac" transformer that knows **how** to read and reason but knows **nothing** about the world. All factual answers come from retrieval over user-provided context at inference time.
+A ~14M parameter "amnesiac" transformer that knows **how** to read and reason but knows **nothing** about the world. All factual answers come from retrieval over user-provided context at inference time.
 
 ## Capabilities
 
@@ -12,7 +12,7 @@ A ~12M parameter "amnesiac" transformer that knows **how** to read and reason bu
 
 The **1024-token context window** is a deliberate design constraint, not a limitation. PicoRouter is built to make fast, precise decisions on small chunks that have already been retrieved or pre-selected — not to hold entire documents.
 
-### Where a short-context 12M model shines
+### Where a short-context 14M model shines
 
 **1. RAG answer generation**
 
@@ -48,7 +48,7 @@ User query + tool schemas
       → Bigger model (synthesizes final answer if needed)
 ```
 
-The value proposition is **speed, cost, and deployability**. A 12M model runs in single-digit milliseconds on a CPU, fits in ~50MB of memory, can run on a phone or a Raspberry Pi, and costs effectively zero per inference. A 7B model doing the same task is 500x larger, 100x slower, and needs a GPU.
+The value proposition is **speed, cost, and deployability**. A 14M model runs in single-digit milliseconds on a CPU, fits in ~50MB of memory, can run on a phone or a Raspberry Pi, and costs effectively zero per inference. A 7B model doing the same task is 500x larger, 100x slower, and needs a GPU.
 
 ## Architecture
 

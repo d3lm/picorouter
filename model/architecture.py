@@ -1,4 +1,4 @@
-"""LLaMA-style 12M-parameter decoder-only transformer in PyTorch."""
+"""LLaMA-style ~14M-parameter decoder-only transformer in PyTorch."""
 
 from dataclasses import dataclass
 

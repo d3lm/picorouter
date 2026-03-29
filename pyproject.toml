@@ -1,7 +1,7 @@
 [project]
 name = "picorouter"
 version = "0.1.0"
-description = "PicoRouter is a ~12M parameter amnesiac transformer for context-grounded Q&A, tool-calling, and browser-based inference"
+description = "PicoRouter is a ~14M parameter amnesiac transformer for context-grounded Q&A, tool-calling, and browser-based inference"
 readme = "README.md"
 requires-python = ">=3.11"
 
