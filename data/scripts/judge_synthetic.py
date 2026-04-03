@@ -2,14 +2,14 @@
 
 Grades every row in a synthetic JSONL file against a multi-dimensional rubric
 using a stronger LLM, then writes a scored copy and a filtered "clean" dataset.
+Uses system-message prompt caching to reduce repeated rubric token costs.
 
 Usage:
   uv run python -m data.scripts.judge_synthetic \
     --mode tools \
     --input data/synthetic/tools.jsonl \
     --output data/synthetic/tools.judged.jsonl \
-    --provider anthropic \
-    --model claude-sonnet-4-6 \
+    --provider glm \
     --concurrency 10 \
     --threshold 2.4
 """
@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from data.scripts.generate_synthetic import (
+  PROVIDER_CHOICES,
   CostTracker,
   LLMProvider,
   ProgressTracker,
@@ -39,8 +40,8 @@ log = logging.getLogger(__name__)
 
 DIMENSIONS = ["routing", "faithfulness", "naturalness", "quality", "relevance"]
 
-TOOLS_JUDGE_PROMPT = """\
-You are an expert data-quality judge. Score the following synthetic training example \
+TOOLS_JUDGE_SYSTEM_PROMPT = """\
+You are an expert data-quality judge. Score synthetic training examples \
 on 5 dimensions using a 1-3 scale.
 
 ## Rubric
@@ -71,8 +72,14 @@ For tool-call responses, is the question a reasonable real-world query (it does 
   2 (ok): Loosely relevant / generic but plausible
   3 (good): Context-answer with strong topical connection, OR tool-call with a natural real-world need
 
-## Example to judge
+## Instructions
 
+Score each dimension 1-3. Provide a 1-2 sentence explanation justifying your lowest score.
+
+Respond with ONLY a JSON object (no other text):
+{{"routing": N, "faithfulness": N, "naturalness": N, "quality": N, "relevance": N, "explanation": "..."}}"""
+
+TOOLS_JUDGE_USER_PROMPT = """\
 Context passage:
 {context}
 
@@ -83,18 +90,11 @@ User question:
 {question}
 
 Assistant response:
-{response}
+{response}"""
 
-## Instructions
-
-Score each dimension 1-3. Provide a 1-2 sentence explanation justifying your lowest score.
-
-Respond with ONLY a JSON object (no other text):
-{{"routing": N, "faithfulness": N, "naturalness": N, "quality": N, "relevance": N, "explanation": "..."}}"""
-
-MULTITURN_JUDGE_PROMPT = """\
-You are an expert data-quality judge. Score the following synthetic multi-turn \
-conversation on 5 dimensions using a 1-3 scale.
+MULTITURN_JUDGE_SYSTEM_PROMPT = """\
+You are an expert data-quality judge. Score synthetic multi-turn \
+conversations on 5 dimensions using a 1-3 scale.
 
 ## Rubric
 
@@ -123,14 +123,6 @@ Relevance: Are the questions meaningfully related to the document?
   2 (ok): Loosely relevant
   3 (good): Strong topical connection
 
-## Conversation to judge
-
-Context passage:
-{context}
-
-Conversation:
-{conversation}
-
 ## Instructions
 
 Score each dimension 1-3. Provide a 1-2 sentence explanation justifying your lowest score.
@@ -138,8 +130,21 @@ Score each dimension 1-3. Provide a 1-2 sentence explanation justifying your low
 Respond with ONLY a JSON object (no other text):
 {{"routing": N, "faithfulness": N, "naturalness": N, "quality": N, "relevance": N, "explanation": "..."}}"""
 
+MULTITURN_JUDGE_USER_PROMPT = """\
+Context passage:
+{context}
 
-def build_judge_prompt(row: dict, mode: str) -> str:
+Conversation:
+{conversation}"""
+
+
+def get_judge_system_prompt(mode: str) -> str:
+  if mode == "tools":
+    return TOOLS_JUDGE_SYSTEM_PROMPT
+  return MULTITURN_JUDGE_SYSTEM_PROMPT
+
+
+def build_judge_user_prompt(row: dict, mode: str) -> str:
   context = row.get("context", "")
   conversation = row.get("conversation", [])
 
@@ -154,18 +159,18 @@ def build_judge_prompt(row: dict, mode: str) -> str:
       elif turn["role"] == "assistant":
         response = turn["content"]
 
-    return TOOLS_JUDGE_PROMPT.format(
+    return TOOLS_JUDGE_USER_PROMPT.format(
       context=context,
       tools=tools_json,
       question=question,
       response=response,
     )
 
-  conversation = "\n".join(f"{turn['role'].upper()}: {turn['content']}" for turn in conversation)
+  conv_text = "\n".join(f"{turn['role'].upper()}: {turn['content']}" for turn in conversation)
 
-  return MULTITURN_JUDGE_PROMPT.format(
+  return MULTITURN_JUDGE_USER_PROMPT.format(
     context=context,
-    conversation=conversation,
+    conversation=conv_text,
   )
 
 
@@ -202,6 +207,7 @@ async def judge_row(
   clean_file,
   write_lock: asyncio.Lock,
   threshold: float,
+  system_prompt: str,
 ) -> dict[str, bool | None]:
   """Judge a single row. Returns {"judged": bool, "passed": bool|None}."""
   row_id = str(line_idx)
@@ -209,11 +215,14 @@ async def judge_row(
   if progress.is_done(row_id):
     return {"judged": False, "passed": None}
 
-  prompt = build_judge_prompt(row, mode)
+  user_prompt = build_judge_user_prompt(row, mode)
 
   try:
-    response_text, model, in_tok, out_tok = await provider.generate(prompt)
-    cost.record(model, in_tok, out_tok)
+    response_text, model, in_tok, out_tok, cache_read, cache_write = await provider.generate(
+      user_prompt,
+      system=system_prompt,
+    )
+    cost.record(model, in_tok, out_tok, cache_read, cache_write)
   except Exception as exc:
     log.warning("Row %d: API error: %s", line_idx, exc)
     return {"judged": False, "passed": None}
@@ -311,6 +320,7 @@ async def run_judge(
     log.info("Nothing to do — all rows already judged")
     return
 
+  system_prompt = get_judge_system_prompt(mode)
   sem = asyncio.Semaphore(concurrency)
   write_lock = asyncio.Lock()
 
@@ -343,6 +353,7 @@ async def run_judge(
           clean_file,
           write_lock,
           threshold,
+          system_prompt,
         )
 
         processed += 1
@@ -451,15 +462,15 @@ def main():
   parser.add_argument("--output", required=True, type=Path, help="Output judged JSONL file")
   parser.add_argument(
     "--provider",
-    default="anthropic",
-    choices=["anthropic", "openai", "round-robin"],
-    help="LLM provider (default: anthropic)",
+    default="glm",
+    choices=PROVIDER_CHOICES,
+    help="LLM provider (default: glm)",
   )
   parser.add_argument(
     "--model",
     action="append",
     default=None,
-    help="Model override (default: claude-sonnet-4-6). For round-robin use PROVIDER=MODEL (repeatable)",
+    help="Model override (default: glm-5). For round-robin use PROVIDER=MODEL (repeatable)",
   )
   parser.add_argument("--concurrency", type=int, default=10, help="Max concurrent API requests (default: 10)")
   parser.add_argument("--threshold", type=float, default=2.4, help="Pass threshold for average score (default: 2.4)")
@@ -480,7 +491,7 @@ def main():
   model, models = _parse_model_args(args.model)
 
   if args.provider != "round-robin" and model is None:
-    model = "claude-sonnet-4-6"
+    model = "glm-5"
 
   provider = make_provider(args.provider, model=model, models=models)
   rows = load_rows(args.input, args.limit)

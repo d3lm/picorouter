@@ -32,7 +32,9 @@ uv run python -m data.scripts.download_sources --source simplewiki --resume
 
 ## Synthetic Data Generation
 
-Requires `ANTHROPIC_API_KEY` and/or `OPENAI_API_KEY` environment variables.
+Requires at least one provider API key in environment variables: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `BASETEN_API_KEY`.
+
+All providers use prompt caching (Anthropic via `cache_control`, OpenAI-compatible APIs via automatic prefix caching) — the static system prompt (instructions + tool schemas) is cached across requests to reduce input token costs.
 
 **Tool-calling data**:
 
@@ -41,7 +43,7 @@ uv run python -m data.scripts.generate_synthetic \
   --mode tools \
   --input data/sources/simplewiki_passages.jsonl \
   --output data/synthetic/tools.jsonl \
-  --provider round-robin \
+  --provider minimax \
   --concurrency 10 \
   --limit 12000
 ```
@@ -54,11 +56,13 @@ uv run python -m data.scripts.generate_synthetic \
   --input data/sources/simplewiki_passages.jsonl \
   --output data/synthetic/multiturn.jsonl \
   --provider round-robin \
+  --model minimax=minimax-m2.5 \
+  --model kimi=kimi-k2.5 \
   --concurrency 10 \
   --limit 20000
 ```
 
-Options: `--provider anthropic|openai|round-robin`, `--model MODEL` (or `--model anthropic=MODEL --model openai=MODEL` for round-robin), `--concurrency N`, `--limit N`. The script auto-resumes on interrupt via a `.progress.jsonl` sidecar file. Errors are logged to `<output>.errors.jsonl`.
+Options: `--provider anthropic|openai|minimax|kimi|glm|round-robin`, `--model MODEL` (or `--model PROVIDER=MODEL` for round-robin), `--concurrency N`, `--limit N`. The script auto-resumes on interrupt via a `.progress.jsonl` sidecar file. Errors are logged to `<output>.errors.jsonl`.
 
 ## Quality Judging (LLM-as-Judge)
 
@@ -69,8 +73,7 @@ uv run python -m data.scripts.judge_synthetic \
   --mode tools \
   --input data/synthetic/tools.jsonl \
   --output data/synthetic/tools.judged.jsonl \
-  --provider anthropic \
-  --model claude-sonnet-4-6 \
+  --provider glm \
   --concurrency 10 \
   --threshold 2.4
 ```

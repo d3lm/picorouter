@@ -1,14 +1,16 @@
 """Generate synthetic training data via LLM APIs.
 
 Supports tool-calling and multi-turn conversation generation using
-Anthropic and OpenAI as providers.
+Anthropic, OpenAI, MiniMax, Kimi, and GLM as providers.  All providers
+use prompt caching (Anthropic via explicit cache_control, OpenAI-compatible
+APIs via automatic prefix caching) to reduce input token costs.
 
 Usage:
   uv run python -m data.scripts.generate_synthetic \
     --mode tools \
     --input data/sources/simplewiki_passages.jsonl \
     --output data/synthetic/tools.jsonl \
-    --provider round-robin \
+    --provider minimax \
     --concurrency 10 \
     --limit 12000
 
@@ -17,8 +19,8 @@ Usage:
     --input data/sources/simplewiki_passages.jsonl \
     --output data/synthetic/multiturn.jsonl \
     --provider round-robin \
-    --model anthropic=claude-sonnet-4-6 \
-    --model openai=gpt-5.4 \
+    --model anthropic=claude-haiku-4-5 \
+    --model minimax=minimax-m2.5 \
     --concurrency 10 \
     --limit 20000
 """
@@ -45,10 +47,23 @@ ROOT = Path(__file__).resolve().parents[2]
 TOOL_SCHEMAS_PATH = ROOT / "data" / "tool_schemas.json"
 
 PRICING = {
-  "claude-haiku-4-5": {"input": 1.00 / 1_000_000, "output": 5.00 / 1_000_000},
-  "claude-sonnet-4-6": {"input": 3.00 / 1_000_000, "output": 15.00 / 1_000_000},
-  "gpt-4o-mini": {"input": 0.15 / 1_000_000, "output": 0.60 / 1_000_000},
-  "gpt-5.4": {"input": 2.50 / 1_000_000, "output": 15.00 / 1_000_000},
+  # Anthropic — cache_read = 10% of input, cache_write = 125% of input
+  "claude-haiku-4-5": {"input": 1.00 / 1e6, "output": 5.00 / 1e6, "cache_read": 0.10 / 1e6, "cache_write": 1.25 / 1e6},
+  "claude-sonnet-4-6": {
+    "input": 3.00 / 1e6,
+    "output": 15.00 / 1e6,
+    "cache_read": 0.30 / 1e6,
+    "cache_write": 3.75 / 1e6,
+  },
+  # OpenAI — cache_read = 50% of input (automatic prefix caching)
+  "gpt-4o-mini": {"input": 0.15 / 1e6, "output": 0.60 / 1e6, "cache_read": 0.075 / 1e6},
+  "gpt-5.4": {"input": 2.50 / 1e6, "output": 15.00 / 1e6, "cache_read": 1.25 / 1e6},
+  # MiniMax — cached input $0.03/MTok
+  "minimax-m2.5": {"input": 0.19 / 1e6, "output": 0.95 / 1e6, "cache_read": 0.03 / 1e6},
+  # Kimi / Moonshot — cached input $0.10/MTok
+  "kimi-k2.5": {"input": 0.60 / 1e6, "output": 2.00 / 1e6, "cache_read": 0.10 / 1e6},
+  # GLM / Zhipu
+  "glm-5": {"input": 0.72 / 1e6, "output": 2.30 / 1e6},
 }
 
 
@@ -62,23 +77,56 @@ class CostTracker:
   cost_usd: float = 0.0
   _by_model: dict[str, dict[str, float]] = field(default_factory=dict)
 
-  def record(self, model: str, input_tokens: int, output_tokens: int) -> None:
+  def record(
+    self,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+  ) -> None:
     self.input_tokens += input_tokens
     self.output_tokens += output_tokens
     self.requests += 1
+
     pricing = PRICING.get(model, {"input": 0.0, "output": 0.0})
-    cost = input_tokens * pricing["input"] + output_tokens * pricing["output"]
+
+    regular_input = input_tokens - cache_read_tokens - cache_creation_tokens
+
+    cost = (
+      max(0, regular_input) * pricing["input"]
+      + output_tokens * pricing["output"]
+      + cache_read_tokens * pricing.get("cache_read", pricing["input"])
+      + cache_creation_tokens * pricing.get("cache_write", pricing["input"])
+    )
+
     self.cost_usd += cost
-    bucket = self._by_model.setdefault(model, {"input": 0, "output": 0, "cost": 0.0})
+
+    bucket = self._by_model.setdefault(
+      model,
+      {"input": 0, "output": 0, "cost": 0.0, "cache_read": 0, "cache_write": 0},
+    )
+
     bucket["input"] += input_tokens
     bucket["output"] += output_tokens
     bucket["cost"] += cost
+    bucket["cache_read"] += cache_read_tokens
+    bucket["cache_write"] += cache_creation_tokens
 
   def summary(self) -> str:
     lines = [f"Total: {self.requests} reqs, {self.input_tokens} in / {self.output_tokens} out, ${self.cost_usd:.4f}"]
 
     for model, stats in self._by_model.items():
-      lines.append(f"  {model}: {int(stats['input'])} in / {int(stats['output'])} out, ${stats['cost']:.4f}")
+      cache_info = ""
+
+      cache_read, cache_write = int(stats.get("cache_read", 0)), int(stats.get("cache_write", 0))
+
+      if cache_read or cache_write:
+        cache_info = f" (cache: {cache_read} read, {cache_write} write)"
+
+      lines.append(
+        f"  {model}: {int(stats['input'])} in / {int(stats['output'])} out, ${stats['cost']:.4f}{cache_info}"
+      )
 
     return "\n".join(lines)
 
@@ -116,14 +164,24 @@ class ProgressTracker:
 class LLMProvider(ABC):
   """Base class for LLM API providers."""
 
+  model: str
+
   @abstractmethod
-  async def generate(self, prompt: str) -> tuple[str, str, int, int]:
-    """Send prompt, return (response_text, model_name, input_tokens, output_tokens)."""
+  async def generate(
+    self,
+    prompt: str,
+    *,
+    system: str | None = None,
+  ) -> tuple[str, str, int, int, int, int]:
+    """Send prompt, return (text, model, input_tok, output_tok, cache_read_tok, cache_create_tok)."""
 
 
 DEFAULT_MODELS = {
   "anthropic": "claude-sonnet-4-6",
   "openai": "gpt-5.4",
+  "minimax": "MiniMaxAI/MiniMax-M2.5",
+  "kimi": "moonshotai/Kimi-K2.5",
+  "glm": "zai-org/GLM-5",
 }
 
 
@@ -134,20 +192,35 @@ class AnthropicProvider(LLMProvider):
     self.client = anthropic.AsyncAnthropic()
     self.model = model or DEFAULT_MODELS["anthropic"]
 
-  async def generate(self, prompt: str) -> tuple[str, str, int, int]:
+  async def generate(
+    self,
+    prompt: str,
+    *,
+    system: str | None = None,
+  ) -> tuple[str, str, int, int, int, int]:
     import anthropic
+
+    kwargs: dict[str, Any] = {
+      "model": self.model,
+      "max_tokens": 4096,
+      "messages": [{"role": "user", "content": prompt}],
+    }
+    if system:
+      kwargs["system"] = [
+        {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}},
+      ]
 
     for attempt in range(6):
       try:
-        response = await self.client.messages.create(
-          model=self.model,
-          max_tokens=2048,
-          messages=[{"role": "user", "content": prompt}],
-        )
+        response = await self.client.messages.create(**kwargs)
 
         text = response.content[0].text
+        usage = response.usage
+        cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+        cache_create = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        total_in = usage.input_tokens + cache_read + cache_create
 
-        return text, self.model, response.usage.input_tokens, response.usage.output_tokens
+        return text, self.model, total_in, usage.output_tokens, cache_read, cache_create
       except anthropic.RateLimitError:
         wait = min(2**attempt + random.random(), 60)
         log.warning("Anthropic rate limit, retrying in %.1fs (attempt %d/6)", wait, attempt + 1)
@@ -163,66 +236,138 @@ class AnthropicProvider(LLMProvider):
     raise RuntimeError("Anthropic: max retries exceeded")
 
 
-class OpenAIProvider(LLMProvider):
-  def __init__(self, model: str | None = None):
+class OpenAICompatibleProvider(LLMProvider):
+  """Provider for OpenAI and any OpenAI-compatible API (MiniMax, Kimi, GLM, …)."""
+
+  def __init__(self, model: str, base_url: str | None = None, api_key: str | None = None):
     import openai
 
-    self.client = openai.AsyncOpenAI()
-    self.model = model or DEFAULT_MODELS["openai"]
+    kwargs: dict[str, Any] = {}
 
-  async def generate(self, prompt: str) -> tuple[str, str, int, int]:
+    if base_url:
+      kwargs["base_url"] = base_url
+
+    if api_key is not None:
+      kwargs["api_key"] = api_key
+
+    self.client = openai.AsyncOpenAI(**kwargs)
+    self.model = model
+
+  async def generate(
+    self,
+    prompt: str,
+    *,
+    system: str | None = None,
+  ) -> tuple[str, str, int, int, int, int]:
     import openai
+
+    messages: list[dict[str, str]] = []
+
+    if system:
+      messages.append({"role": "system", "content": system})
+
+    messages.append({"role": "user", "content": prompt})
 
     for attempt in range(6):
       try:
         response = await self.client.chat.completions.create(
           model=self.model,
-          max_completion_tokens=64000,
-          messages=[{"role": "user", "content": prompt}],
+          max_completion_tokens=4096,
+          messages=messages,
         )
 
         text = response.choices[0].message.content or ""
         usage = response.usage
 
-        return text, self.model, usage.prompt_tokens, usage.completion_tokens
+        cache_read = 0
+
+        if hasattr(usage, "prompt_tokens_details") and usage.prompt_tokens_details:
+          cache_read = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+
+        return text, self.model, usage.prompt_tokens, usage.completion_tokens, cache_read, 0
       except openai.RateLimitError:
         wait = min(2**attempt + random.random(), 60)
-        log.warning("OpenAI rate limit, retrying in %.1fs (attempt %d/6)", wait, attempt + 1)
+        log.warning("%s rate limit, retrying in %.1fs (attempt %d/6)", self.model, wait, attempt + 1)
         await asyncio.sleep(wait)
       except openai.APIStatusError as exc:
         if exc.status_code >= 500:
           wait = min(2**attempt + random.random(), 60)
-          log.warning("OpenAI %d error, retrying in %.1fs", exc.status_code, wait)
+          log.warning("%s %d error, retrying in %.1fs", self.model, exc.status_code, wait)
           await asyncio.sleep(wait)
         else:
           raise
 
-    raise RuntimeError("OpenAI: max retries exceeded")
+    raise RuntimeError(f"{self.model}: max retries exceeded")
+
+
+class OpenAIProvider(OpenAICompatibleProvider):
+  def __init__(self, model: str | None = None):
+    super().__init__(model=model or DEFAULT_MODELS["openai"])
+
+
+class MiniMaxProvider(OpenAICompatibleProvider):
+  def __init__(self, model: str | None = None):
+    super().__init__(
+      model=model or DEFAULT_MODELS["minimax"],
+      base_url="https://inference.baseten.co/v1",
+      api_key=os.environ.get("BASETEN_API_KEY", ""),
+    )
+
+
+class KimiProvider(OpenAICompatibleProvider):
+  def __init__(self, model: str | None = None):
+    super().__init__(
+      model=model or DEFAULT_MODELS["kimi"],
+      base_url="https://inference.baseten.co/v1",
+      api_key=os.environ.get("BASETEN_API_KEY", ""),
+    )
+
+
+class GLMProvider(OpenAICompatibleProvider):
+  def __init__(self, model: str | None = None):
+    super().__init__(
+      model=model or DEFAULT_MODELS["glm"],
+      base_url="https://inference.baseten.co/v1",
+      api_key=os.environ.get("BASETEN_API_KEY", ""),
+    )
 
 
 class RoundRobinProvider(LLMProvider):
-  """Alternates between Anthropic and OpenAI to stay under per-provider rate limits."""
+  """Alternates between available providers to stay under per-provider rate limits."""
 
   def __init__(self, models: dict[str, str] | None = None):
     self._providers: list[LLMProvider] = []
     self._idx = 0
     models = models or {}
 
-    if os.environ.get("ANTHROPIC_API_KEY"):
-      self._providers.append(AnthropicProvider(model=models.get("anthropic")))
+    provider_env_keys: list[tuple[str, type[LLMProvider], str]] = [
+      ("ANTHROPIC_API_KEY", AnthropicProvider, "anthropic"),
+      ("OPENAI_API_KEY", OpenAIProvider, "openai"),
+      ("BASETEN_API_KEY", MiniMaxProvider, "minimax"),
+      ("BASETEN_API_KEY", KimiProvider, "kimi"),
+      ("BASETEN_API_KEY", GLMProvider, "glm"),
+    ]
 
-    if os.environ.get("OPENAI_API_KEY"):
-      self._providers.append(OpenAIProvider(model=models.get("openai")))
+    for env_key, cls, name in provider_env_keys:
+      if os.environ.get(env_key):
+        self._providers.append(cls(model=models.get(name)))
 
     if not self._providers:
-      raise RuntimeError("Round-robin requires at least one of ANTHROPIC_API_KEY or OPENAI_API_KEY")
+      raise RuntimeError("Round-robin requires at least one provider API key in env")
+
+    self.model = f"round-robin({','.join(p.model for p in self._providers)})"
 
     log.info("Round-robin with %d providers: %s", len(self._providers), [p.model for p in self._providers])
 
-  async def generate(self, prompt: str) -> tuple[str, str, int, int]:
+  async def generate(
+    self,
+    prompt: str,
+    *,
+    system: str | None = None,
+  ) -> tuple[str, str, int, int, int, int]:
     provider = self._providers[self._idx % len(self._providers)]
     self._idx += 1
-    return await provider.generate(prompt)
+    return await provider.generate(prompt, system=system)
 
 
 def _parse_model_args(raw: list[str] | None) -> tuple[str | None, dict[str, str]]:
@@ -247,19 +392,25 @@ def _parse_model_args(raw: list[str] | None) -> tuple[str | None, dict[str, str]
   return single, per_provider
 
 
+PROVIDER_FACTORIES: dict[str, type[LLMProvider]] = {
+  "anthropic": AnthropicProvider,
+  "openai": OpenAIProvider,
+  "minimax": MiniMaxProvider,
+  "kimi": KimiProvider,
+  "glm": GLMProvider,
+}
+
+PROVIDER_CHOICES = [*PROVIDER_FACTORIES, "round-robin"]
+
+
 def make_provider(name: str, model: str | None = None, models: dict[str, str] | None = None) -> LLMProvider:
   if name == "round-robin":
     return RoundRobinProvider(models=models)
 
-  factories: dict[str, type[LLMProvider]] = {
-    "anthropic": AnthropicProvider,
-    "openai": OpenAIProvider,
-  }
+  if name not in PROVIDER_FACTORIES:
+    raise ValueError(f"Unknown provider: {name}. Choose from: {', '.join(PROVIDER_CHOICES)}")
 
-  if name not in factories:
-    raise ValueError(f"Unknown provider: {name}. Choose from: anthropic, openai, round-robin")
-
-  return factories[name](model=model)
+  return PROVIDER_FACTORIES[name](model=model)
 
 
 def extract_json(text: str) -> Any:
@@ -280,10 +431,10 @@ def extract_json(text: str) -> Any:
   return json.loads(text)
 
 
-TOOLS_PROMPT = """\
+TOOLS_SYSTEM_PROMPT = """\
 You are generating training data for a model that can either answer from context
-or call tools. Given the context passage and available tools below, generate
-exactly 7 examples:
+or call tools. Given a context passage provided by the user and the available
+tools below, generate exactly 7 examples:
 
 - 4 questions where the correct response is a tool_call (the context does NOT contain the answer, but a tool can help)
 - 3 questions where the answer IS in the context (no tool needed)
@@ -296,9 +447,6 @@ CRITICAL RULES:
 
 For tool calls, the response must be a JSON object: {{"tool_call": {{"name": "...", "arguments": {{...}}}}}}
 For context answers, respond with a grounded answer citing the context with [source: sentence N].
-
-Context:
-{passage_text}
 
 Available tools:
 {tool_schemas_json}
@@ -316,6 +464,8 @@ Respond with ONLY a JSON array (no other text):
     "response": "Based on the context, ... [source: sentence N]"
   }}
 ]"""
+
+TOOLS_USER_PROMPT = "Context:\n{passage_text}"
 
 
 def _load_tool_schemas() -> list[dict]:
@@ -399,10 +549,10 @@ def process_tools_response(
   return examples
 
 
-MULTITURN_PROMPT = """\
+MULTITURN_SYSTEM_PROMPT = """\
 You are generating training data for a conversational reading comprehension model.
-Given the document below, simulate a realistic 4-6 turn conversation between a
-user and an assistant.
+Given a document provided by the user, simulate a realistic 4-6 turn conversation
+between a user and an assistant.
 
 Rules:
 - The assistant ALWAYS grounds responses in the document with [source: sentence N] citations
@@ -413,9 +563,6 @@ Rules:
   context to answer that question."
 - Make the conversation feel natural, not like a quiz
 
-Document:
-{passage_text}
-
 Respond with ONLY a JSON array of conversation turns (no other text):
 [
   {{"role": "user", "content": "..."}},
@@ -424,6 +571,8 @@ Respond with ONLY a JSON array of conversation turns (no other text):
   {{"role": "assistant", "content": "..."}},
   ...
 ]"""
+
+MULTITURN_USER_PROMPT = "Document:\n{passage_text}"
 
 REFUSAL_PHRASE = "I don't have enough information in the provided context"
 
@@ -477,6 +626,7 @@ async def process_passage(
   write_lock: asyncio.Lock,
   tool_schemas: list[dict] | None,
   errors_file,
+  system_prompt: str | None,
 ) -> int:
   """Process a single passage. Returns number of examples written."""
   pid = passage["id"]
@@ -485,16 +635,17 @@ async def process_passage(
     return 0
 
   if mode == "tools":
-    prompt = TOOLS_PROMPT.format(
-      passage_text=passage["text"],
-      tool_schemas_json=json.dumps(tool_schemas, indent=2),
-    )
+    user_prompt = TOOLS_USER_PROMPT.format(passage_text=passage["text"])
   else:
-    prompt = MULTITURN_PROMPT.format(passage_text=passage["text"])
+    user_prompt = MULTITURN_USER_PROMPT.format(passage_text=passage["text"])
 
   try:
-    response_text, model, in_tok, out_tok = await provider.generate(prompt)
-    cost.record(model, in_tok, out_tok)
+    response_text, model, in_tok, out_tok, cache_read, cache_write = await provider.generate(
+      user_prompt,
+      system=system_prompt,
+    )
+
+    cost.record(model, in_tok, out_tok, cache_read, cache_write)
   except Exception as exc:
     async with write_lock:
       errors_file.write(json.dumps({"id": pid, "error": f"api: {exc}", "mode": mode}) + "\n")
@@ -584,6 +735,13 @@ async def run_pipeline(
     log.info("Nothing to do — all passages already processed")
     return
 
+  if mode == "tools":
+    system_prompt = TOOLS_SYSTEM_PROMPT.format(
+      tool_schemas_json=json.dumps(tool_schemas, indent=2),
+    )
+  else:
+    system_prompt = MULTITURN_SYSTEM_PROMPT
+
   sem = asyncio.Semaphore(concurrency)
   write_lock = asyncio.Lock()
   total_examples = 0
@@ -612,6 +770,7 @@ async def run_pipeline(
           write_lock,
           tool_schemas,
           errors_file,
+          system_prompt,
         )
 
         total_examples += n
@@ -714,7 +873,7 @@ def main():
   parser.add_argument(
     "--provider",
     default="round-robin",
-    choices=["anthropic", "openai", "round-robin"],
+    choices=PROVIDER_CHOICES,
     help="LLM provider (default: round-robin)",
   )
   parser.add_argument(
