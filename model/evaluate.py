@@ -1,11 +1,10 @@
-"""Evaluation suite for PicoRouter.
+"""Evaluation suite for PicoRouter grounded QA mode.
 
 Metrics:
-  1. Extractive F1 / Exact Match (RC examples)
-  2. Tool-call accuracy (tool examples)
-  3. Refusal rate (refusal examples)
-  4. Hallucination probe (adversarial context/question mismatch)
-  5. Latency benchmark (tokens/sec at various context lengths)
+  1. Extractive F1 / Exact Match (answerable examples)
+  2. Refusal rate (unanswerable examples)
+  3. Hallucination probe (adversarial context/question mismatch)
+  4. Latency benchmark (tokens/sec at various context lengths)
 """
 
 import argparse
@@ -271,18 +270,17 @@ def load_test_examples() -> dict[str, list[dict]]:
   n_train = n - n_val - n_test
   test_set = kept[n_train + n_val :]
 
-  groups: dict[str, list[dict]] = {"rc": [], "tool": [], "refusal": []}
+  groups: dict[str, list[dict]] = {"rc": [], "refusal": []}
 
-  for ex in test_set:
-    has_tools = bool(ex.get("tools"))
-    is_refusal = any(REFUSAL_PHRASE in t["content"] for t in ex["conversation"] if t["role"] == "assistant")
+  for example in test_set:
+    is_refusal = any(
+      REFUSAL_PHRASE in turn["content"] for turn in example["conversation"] if turn["role"] == "assistant"
+    )
 
     if is_refusal:
-      groups["refusal"].append(ex)
-    elif has_tools:
-      groups["tool"].append(ex)
+      groups["refusal"].append(example)
     else:
-      groups["rc"].append(ex)
+      groups["rc"].append(example)
 
   with open(CACHED_TEST_PATH, "w", encoding="utf-8") as cached_test_file:
     json.dump(groups, cached_test_file)
@@ -301,16 +299,11 @@ def build_prompt_tokens(tokenizer, example: dict) -> list[int]:
   from model.tokenizer import get_special_token_id
 
   ctx_id = get_special_token_id(tokenizer, "<|context|>")
-  tools_id = get_special_token_id(tokenizer, "<|tools|>")
   user_id = get_special_token_id(tokenizer, "<|user|>")
   asst_id = get_special_token_id(tokenizer, "<|assistant|>")
 
   tokens = [ctx_id]
   tokens.extend(tokenizer.encode(example["context"]).ids)
-  tokens.append(tools_id)
-
-  if example.get("tools"):
-    tokens.extend(tokenizer.encode(json.dumps(example["tools"])).ids)
 
   conversation = example["conversation"]
 
@@ -382,7 +375,7 @@ def eval_extractive(
   subset = examples[:max_examples]
 
   prompts = [build_prompt_tokens(tokenizer, example) for example in subset]
-  all_gen_ids = generate_batch(model, prompts, eos_id, device, batch_size=batch_size, desc="[1/5] Extractive")
+  all_gen_ids = generate_batch(model, prompts, eos_id, device, batch_size=batch_size, desc="[1/4] Extractive")
 
   f1_scores, exact_match_scores = [], []
 
@@ -403,110 +396,6 @@ def eval_extractive(
   }
 
 
-def parse_tool_call(text: str) -> dict | None:
-  """Try to extract a tool call from generated text.
-
-  Expected format: <|tool_call|>{"name": ..., "arguments": ...}
-  The special token may already be stripped by the tokenizer, so we also
-  look for a raw JSON object with "name" and "arguments" keys.
-  """
-  text = text.strip()
-
-  json_match = re.search(r'\{[^{}]*"name"\s*:', text)
-
-  if json_match:
-    candidate = text[json_match.start() :]
-    brace_depth = 0
-    end = 0
-
-    for i, ch in enumerate(candidate):
-      if ch == "{":
-        brace_depth += 1
-      elif ch == "}":
-        brace_depth -= 1
-
-        if brace_depth == 0:
-          end = i + 1
-          break
-
-    if end:
-      try:
-        parsed = json.loads(candidate[:end])
-
-        if "name" in parsed:
-          return parsed
-      except json.JSONDecodeError:
-        pass
-
-  return None
-
-
-def parse_gold_tool_call(gold: str) -> dict | None:
-  cleaned = re.sub(r"<\|[a-z_]+\|>", "", gold).strip()
-  return parse_tool_call(cleaned)
-
-
-def eval_tool_accuracy(
-  model: PicoRouter,
-  tokenizer,
-  tool_examples: list[dict],
-  device: torch.device,
-  max_examples: int = 2000,
-  batch_size: int = DEFAULT_BATCH_SIZE,
-  *,
-  rc_gen_ids: list[list[int]],
-  rc_predictions: list[str],
-) -> dict:
-  eos_id = tokenizer.token_to_id("<|eos|>")
-  tool_call_id = tokenizer.token_to_id("<|tool_call|>")
-  tool_subset = tool_examples[:max_examples]
-
-  prompts = [build_prompt_tokens(tokenizer, ex) for ex in tool_subset]
-  all_gen_ids = generate_batch(model, prompts, eos_id, device, batch_size=batch_size, desc="[2/5] Tool-call")
-
-  routing_correct = 0
-  name_correct = 0
-  full_match = 0
-
-  for gen_ids, example in zip(all_gen_ids, tool_subset, strict=True):
-    prediction = tokenizer.decode(gen_ids)
-
-    gold = get_gold_answer(example)
-
-    pred_has_tool = tool_call_id in gen_ids or parse_tool_call(prediction) is not None
-
-    if pred_has_tool:
-      routing_correct += 1
-
-    pred_call = parse_tool_call(prediction)
-    gold_call = parse_gold_tool_call(gold)
-
-    if pred_call and gold_call and pred_call.get("name") == gold_call.get("name"):
-      name_correct += 1
-
-      if pred_call.get("arguments") == gold_call.get("arguments"):
-        full_match += 1
-
-  n_tool = len(tool_subset)
-
-  false_tool = 0
-
-  for gen_ids, prediction in zip(rc_gen_ids, rc_predictions, strict=True):
-    if tool_call_id in gen_ids or parse_tool_call(prediction) is not None:
-      false_tool += 1
-
-  n_rc = len(rc_gen_ids)
-
-  return {
-    "routing_accuracy": round(routing_correct / max(n_tool, 1), 4),
-    "name_accuracy": round(name_correct / max(n_tool, 1), 4),
-    "full_match_accuracy": round(full_match / max(n_tool, 1), 4),
-    "false_tool_call_rate": round(false_tool / max(n_rc, 1), 4),
-    "n_tool": n_tool,
-    "n_rc_for_false_rate": n_rc,
-  }
-
-
 def eval_refusal(
   model: PicoRouter,
   tokenizer,
@@ -524,7 +413,7 @@ def eval_refusal(
   refusal_subset = refusal_examples[:max_examples]
 
   prompts = [build_prompt_tokens(tokenizer, ex) for ex in refusal_subset]
-  all_gen_ids = generate_batch(model, prompts, eos_id, device, batch_size=batch_size, desc="[3/5] Refusal")
+  all_gen_ids = generate_batch(model, prompts, eos_id, device, batch_size=batch_size, desc="[2/4] Refusal")
 
   correct_refusals = 0
 
@@ -605,7 +494,7 @@ def eval_hallucination(
   adversarial = build_adversarial_examples(all_examples, n=n_probes)
 
   prompts = [build_prompt_tokens(tokenizer, ex) for ex in adversarial]
-  all_gen_ids = generate_batch(model, prompts, eos_id, device, batch_size=batch_size, desc="[4/5] Hallucination")
+  all_gen_ids = generate_batch(model, prompts, eos_id, device, batch_size=batch_size, desc="[3/4] Hallucination")
 
   hallucinations = 0
 
@@ -725,10 +614,10 @@ def find_checkpoints() -> list[Path]:
 
 def composite_score(report: dict) -> float:
   f1 = report.get("extractive", {}).get("mean_f1", 0)
-  tool_accuracy = report.get("tool_calling", {}).get("full_match_accuracy", 0)
   refusal = report.get("refusal", {}).get("correct_refusal_rate", 0)
   hallucination = report.get("hallucination", {}).get("hallucination_rate", 1)
-  return 0.3 * f1 + 0.3 * tool_accuracy + 0.2 * refusal + 0.2 * (1 - hallucination)
+  false_refusal = report.get("refusal", {}).get("false_refusal_rate", 1)
+  return 0.25 * f1 + 0.25 * refusal + 0.35 * (1 - hallucination) + 0.15 * (1 - false_refusal)
 
 
 def select_best_checkpoint(reports: dict[str, dict]) -> str | None:
@@ -742,7 +631,6 @@ def run_evaluation(
   checkpoint_dir: Path,
   device: torch.device,
   max_rc: int = 2000,
-  max_tool: int = 2000,
   max_refusal: int = 2000,
   n_hallucination: int = 500,
   skip_latency: bool = False,
@@ -759,51 +647,29 @@ def run_evaluation(
 
   groups = load_test_examples()
 
-  print(f"  RC: {len(groups['rc'])} | Tool: {len(groups['tool'])} | Refusal: {len(groups['refusal'])}")
+  print(f"  RC: {len(groups['rc'])} | Refusal: {len(groups['refusal'])}")
 
-  all_test = groups["rc"] + groups["tool"] + groups["refusal"]
+  all_test = groups["rc"] + groups["refusal"]
   report = {"checkpoint": str(checkpoint_dir.name)}
 
   eos_id = tokenizer.token_to_id("<|eos|>")
   rc_fp_subset = groups["rc"][:500]
 
-  print(f"\n[0/5] Pre-generating RC false-positive predictions (N={len(rc_fp_subset)})...")
+  print(f"\n[0/4] Pre-generating RC false-positive predictions (N={len(rc_fp_subset)})...")
 
   rc_fp_prompts = [build_prompt_tokens(tokenizer, ex) for ex in rc_fp_subset]
-  rc_fp_gen_ids = generate_batch(model, rc_fp_prompts, eos_id, device, batch_size=batch_size, desc="[0/5] RC FP")
+  rc_fp_gen_ids = generate_batch(model, rc_fp_prompts, eos_id, device, batch_size=batch_size, desc="[0/4] RC FP")
   rc_fp_predictions = [tokenizer.decode(ids) for ids in rc_fp_gen_ids]
 
   print("       done")
 
-  print("\n[1/5] Extractive F1 / Exact Match...")
+  print("\n[1/4] Extractive F1 / Exact Match...")
 
   report["extractive"] = eval_extractive(model, tokenizer, groups["rc"], device, max_rc, batch_size)
 
   print(f"       F1={report['extractive']['mean_f1']}  EM={report['extractive']['mean_em']}")
 
-  print("\n[2/5] Tool-call accuracy...")
-
-  report["tool_calling"] = eval_tool_accuracy(
-    model,
-    tokenizer,
-    groups["tool"],
-    device,
-    max_tool,
-    batch_size,
-    rc_gen_ids=rc_fp_gen_ids,
-    rc_predictions=rc_fp_predictions,
-  )
-
-  tool_calling = report["tool_calling"]
-
-  print(
-    "       "
-    f"Routing={tool_calling['routing_accuracy']}  "
-    f"Name={tool_calling['name_accuracy']}  "
-    f"Full={tool_calling['full_match_accuracy']}"
-  )
-
-  print("\n[3/5] Refusal rate...")
+  print("\n[2/4] Refusal rate...")
 
   report["refusal"] = eval_refusal(
     model,
@@ -820,21 +686,21 @@ def run_evaluation(
 
   print(f"       Correct={ref['correct_refusal_rate']}  FalseRefusal={ref['false_refusal_rate']}")
 
-  print("\n[4/5] Hallucination probe...")
+  print("\n[3/4] Hallucination probe...")
 
   report["hallucination"] = eval_hallucination(model, tokenizer, all_test, device, n_hallucination, batch_size)
 
   print(f"       Rate={report['hallucination']['hallucination_rate']}")
 
   if not skip_latency:
-    print("\n[5/5] Latency benchmark...")
+    print("\n[4/4] Latency benchmark...")
 
     report["latency"] = eval_latency(model, tokenizer, device)
 
     for k, v in report["latency"].items():
       print(f"       {k}: TTFT={v['ttft_ms']}ms  {v['tok_per_sec']} tok/s")
   else:
-    print("\n[5/5] Latency benchmark... SKIPPED")
+    print("\n[4/4] Latency benchmark... SKIPPED")
 
   score = composite_score(report)
   report["composite_score"] = round(score, 4)
@@ -854,16 +720,6 @@ def run_evaluation(
   print("Reading Comprehension:")
 
   print(f"  F1: {extractive['mean_f1']} | EM: {extractive['mean_em']} | N={extractive['n']}")
-
-  print()
-
-  print("Tool Calling:")
-
-  print(f"  Routing Accuracy: {tool_calling['routing_accuracy']} | Name Accuracy: {tool_calling['name_accuracy']}")
-
-  print(
-    f"  Full Match: {tool_calling['full_match_accuracy']}  False Tool-Call Rate: {tool_calling['false_tool_call_rate']}"
-  )
 
   print()
 
@@ -910,7 +766,6 @@ def main():
   )
 
   parser.add_argument("--max-rc", type=int, default=2000)
-  parser.add_argument("--max-tool", type=int, default=2000)
   parser.add_argument("--max-refusal", type=int, default=2000)
   parser.add_argument("--n-hallucination", type=int, default=500)
   parser.add_argument("--skip-latency", action="store_true")
@@ -931,7 +786,6 @@ def main():
       checkpoint_dir,
       device,
       max_rc=args.max_rc,
-      max_tool=args.max_tool,
       max_refusal=args.max_refusal,
       n_hallucination=args.n_hallucination,
       skip_latency=args.skip_latency,
@@ -961,7 +815,6 @@ def main():
         checkpoint_dir,
         device,
         max_rc=args.max_rc,
-        max_tool=args.max_tool,
         max_refusal=args.max_refusal,
         n_hallucination=args.n_hallucination,
         skip_latency=args.skip_latency,

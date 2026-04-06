@@ -9,11 +9,8 @@ SPECIAL_TOKENS = [
   "<|pad|>",
   "<|eos|>",
   "<|context|>",
-  "<|tools|>",
   "<|user|>",
   "<|assistant|>",
-  "<|tool_call|>",
-  "<|source|>",
   "<|refuse|>",
 ]
 
@@ -34,9 +31,6 @@ def collect_texts(data_path: Path) -> list[str]:
 
       for turn in example["conversation"]:
         texts.append(turn["content"])
-
-      if example.get("tools"):
-        texts.append(json.dumps(example["tools"]))
 
   return texts
 
@@ -81,10 +75,9 @@ def get_special_token_id(tokenizer: Tokenizer, token: str) -> int:
 def encode_example(tokenizer: Tokenizer, example: dict) -> list[int]:
   """Encode a training example into the packed token sequence.
 
-  Format: <|context|> {context} <|tools|> {tools} <|user|> {question} <|assistant|> {answer} <|eos|>
+  Format: <|context|> {context} <|user|> {question} <|assistant|> {answer} <|eos|>
   """
   ctx_id = get_special_token_id(tokenizer, "<|context|>")
-  tools_id = get_special_token_id(tokenizer, "<|tools|>")
   user_id = get_special_token_id(tokenizer, "<|user|>")
   assistant_id = get_special_token_id(tokenizer, "<|assistant|>")
   eos_id = get_special_token_id(tokenizer, "<|eos|>")
@@ -92,10 +85,6 @@ def encode_example(tokenizer: Tokenizer, example: dict) -> list[int]:
   tokens = [ctx_id]
 
   tokens.extend(tokenizer.encode(example["context"]).ids)
-  tokens.append(tools_id)
-
-  if example.get("tools"):
-    tokens.extend(tokenizer.encode(json.dumps(example["tools"])).ids)
 
   for turn in example["conversation"]:
     if turn["role"] == "user":
