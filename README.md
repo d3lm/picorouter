@@ -62,7 +62,7 @@ uv sync --dev
 
 ## Usage
 
-### Data pipeline
+### Data Pipeline
 
 ```bash
 # Quality-filter, train tokenizer, tokenize + split → train/val/test.npz

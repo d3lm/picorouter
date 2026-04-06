@@ -133,16 +133,7 @@ And with tools available:
 }
 ```
 
-## 5. Multiturn is severely underrepresented
-
-**Problem:** From prior analysis, multiturn examples are ~1.2K vs. tens of thousands of single-turn examples. The model doesn't learn conversation flow.
-
-**Fixes (pick one or both):**
-
-- **Upsample existing multiturn 5-10x** during `step_process` — free, no API cost.
-- **Generate more** with `--mode multiturn --limit 5000` to get ~5K multiturn conversations.
-
-## 6. Evaluation gaps
+## 5. Evaluation gaps
 
 **Problem:** The eval suite (`evaluate.py`) already has a hallucination probe (`build_adversarial_examples`) that does cross-pairing, but this signal isn't fed back into training. Also, the composite score weighs extractive F1 at 0.4 but hallucination at only 0.1:
 
@@ -157,7 +148,7 @@ return 0.4 * f1 + 0.3 * tool_acc + 0.2 * refusal + 0.1 * (1 - halluc)
 - **Run eval before the next training round** to get baseline numbers, then track improvement.
 - **Add an off-topic refusal eval category** in `load_test_examples` — right now, refusal examples only come from same-topic unanswerables. After adding off-topic refusal training data, the test split will naturally include them.
 
-## 7. Retrieval-score signal in the model input
+## 6. Retrieval-score signal in the model input
 
 **Problem:** Even with the retrieval fallback fix (item 3), the model has no way to know _how confident_ retrieval was. It either gets context or doesn't — there's no gradient. A borderline retrieval hit (score 1.1 vs. threshold 1.0) looks identical to a perfect match (score 15.0).
 
@@ -169,34 +160,28 @@ return 0.4 * f1 + 0.3 * tool_acc + 0.2 * refusal + 0.1 * (1 - halluc)
 
 This requires adding the signal to training data generation and to the playground inference path.
 
-## 8. Inference improvements (playground)
+## 7. Inference improvements (playground)
 
-### 8a. Include tool schemas in the prompt
+### 7a. Include tool schemas in the prompt
 
 The playground currently sends `<|tools|>` with nothing after it. The model was trained with tool schemas encoded after `<|tools|>`. Either:
 
 - Include the tool schemas from `data/tool_schemas.json` in the playground so the model can exercise tool-call routing.
 - Or explicitly train on the empty-tools pattern (item 4).
 
-### 8b. Show retrieval scores in the UI
+### 7b. Show retrieval scores in the UI
 
 Display the MiniSearch scores next to retrieved passages so the user can see when retrieval is low-confidence. This helps debug whether failures are retrieval problems vs. model problems.
 
-## 9. Evaluate before fixing multiturn
-
-**Principle:** Before investing in multiturn upsampling or generation (item 5), train and evaluate the model as-is. The model may already handle multiturn adequately despite the data imbalance — solving a problem that doesn't exist wastes effort and risks degrading other capabilities. Run the eval suite, check multiturn-specific metrics, and only invest in fixes if the numbers confirm a gap.
-
 ## Priority order
 
-| #   | Item                                              | Effort                                      | Impact                             |
-| --- | ------------------------------------------------- | ------------------------------------------- | ---------------------------------- |
-| 1   | Off-topic refusal data (item 1)                   | Low — no API cost, cross-pair existing data | Fixes the main hallucination issue |
-| 2   | Retrieval fallback fix (item 3)                   | Low — ~10 lines of code                     | Stops feeding irrelevant context   |
-| 3   | Upsample tool + refusal + multiturn (items 2c, 5) | Low — change `step_process`                 | Rebalances training signal         |
-| 4   | Empty context training (item 4)                   | Low — synthetic, no API cost                | Model handles edge case            |
-| 5   | Eval baseline before multiturn work (item 9)      | Low — just run eval                         | Avoids solving a non-problem       |
-| 6   | More tool schemas + variety (items 2a, 2b)        | Medium — needs API calls                    | Better tool routing                |
-| 7   | Include tools in playground (item 8a)             | Low — load JSON, encode in prompt           | Model uses its training            |
-| 8   | Eval reweighting + baseline (item 6)              | Low — tweak constants, run eval             | Measures improvement               |
-| 9   | Retrieval-score signal (item 7)                   | Medium — new tokens, training + inference   | Model knows retrieval confidence   |
-| 10  | Generate more multiturn (item 5)                  | Medium — API cost                           | Better conversation flow           |
+| #   | Item                                       | Effort                                      | Impact                             |
+| --- | ------------------------------------------ | ------------------------------------------- | ---------------------------------- |
+| 1   | Off-topic refusal data (item 1)            | Low — no API cost, cross-pair existing data | Fixes the main hallucination issue |
+| 2   | Retrieval fallback fix (item 3)            | Low — ~10 lines of code                     | Stops feeding irrelevant context   |
+| 3   | Upsample tool + refusal (item 2c)          | Low — change `step_process`                 | Rebalances training signal         |
+| 4   | Empty context training (item 4)            | Low — synthetic, no API cost                | Model handles edge case            |
+| 5   | More tool schemas + variety (items 2a, 2b) | Medium — needs API calls                    | Better tool routing                |
+| 6   | Include tools in playground (item 7a)      | Low — load JSON, encode in prompt           | Model uses its training            |
+| 7   | Eval reweighting + baseline (item 5)       | Low — tweak constants, run eval             | Measures improvement               |
+| 8   | Retrieval-score signal (item 6)            | Medium — new tokens, training + inference   | Model knows retrieval confidence   |
