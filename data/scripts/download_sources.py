@@ -49,6 +49,7 @@ def wiki_to_plaintext(wikitext: str) -> str:
     "",
     text,
   )
+  text = re.sub(r"\b\d{2,4}(?:x\d{2,4})?px\|", "", text, flags=re.IGNORECASE)
   text = re.sub(r"[ \t]+", " ", text)
   text = re.sub(r"\n{3,}", "\n\n", text)
 
