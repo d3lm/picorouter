@@ -41,11 +41,8 @@ SPECIAL_TOKENS = [
   "<|pad|>",
   "<|eos|>",
   "<|context|>",
-  "<|tools|>",
   "<|user|>",
   "<|assistant|>",
-  "<|tool_call|>",
-  "<|source|>",
   "<|refuse|>",
 ]
 
@@ -53,10 +50,7 @@ ALL_SOURCES = {
   "squad2": DATA_DIR / "open_datasets" / "squad2.jsonl",
   "coqa": DATA_DIR / "open_datasets" / "coqa.jsonl",
   "drop": DATA_DIR / "open_datasets" / "drop.jsonl",
-  "synthetic-tools": DATA_DIR / "synthetic" / "tools.clean.jsonl",
-  "synthetic-tools-v2": DATA_DIR / "synthetic" / "tools_v2.clean.jsonl",
   "synthetic-offtopic-refusal": DATA_DIR / "synthetic" / "offtopic_refusal.jsonl",
-  "synthetic-empty-context": DATA_DIR / "synthetic" / "empty_context.jsonl",
 }
 
 FILTERED_PATH = PROCESSED_DIR / "filtered.jsonl"
@@ -83,7 +77,7 @@ def strip_source_citations(rows: list[dict]) -> tuple[list[dict], int]:
 
       content = turn["content"]
 
-      if "<|tool_call|>" in content or "<|refuse|>" in content:
+      if "<|refuse|>" in content:
         continue
 
       cleaned = _CITATION_RE.sub("", content).strip()
@@ -142,7 +136,7 @@ def _check_row(row: dict) -> list[str]:
   """Run all automated checks on one row. Empty list = pass."""
   errors: list[str] = []
 
-  for key in ("context", "tools", "conversation"):
+  for key in ("context", "conversation"):
     if key not in row:
       errors.append(f"missing '{key}'")
 
@@ -151,13 +145,11 @@ def _check_row(row: dict) -> list[str]:
 
   word_count = _count_words(row.get("context", ""))
 
-  allows_empty_context = row.get("source") == "synthetic-empty-context"
-
   if word_count > MAX_CONTEXT_WORDS:
     errors.append(f"context {word_count} words exceeds {MAX_CONTEXT_WORDS}")
     return errors
 
-  if not allows_empty_context and word_count < MIN_CONTEXT_WORDS:
+  if word_count < MIN_CONTEXT_WORDS:
     errors.append(f"context {word_count} words below {MIN_CONTEXT_WORDS}")
     return errors
 
@@ -222,11 +214,7 @@ def run_automated_checks(rows: list[dict]) -> tuple[list[dict], dict]:
 
 
 def exact_dedup(rows: list[dict]) -> tuple[list[dict], int]:
-  """Exact-match dedup on (context, first_question). Returns (deduped, n_removed).
-
-  For empty-context rows, the tools list is included in the key so that
-  the same question with different tool subsets is kept as distinct examples.
-  """
+  """Exact-match dedup on (context, first_question). Returns (deduped, n_removed)."""
   seen: set[tuple[str, ...]] = set()
   deduped: list[dict] = []
 
@@ -234,7 +222,7 @@ def exact_dedup(rows: list[dict]) -> tuple[list[dict], int]:
     conv = row.get("conversation", [])
     ctx = row.get("context", "")
     question = conv[0].get("content", "") if conv else ""
-    key = (ctx, question) if ctx else (ctx, question, json.dumps(row.get("tools", []), sort_keys=True))
+    key = (ctx, question)
 
     if key in seen:
       continue
@@ -324,12 +312,10 @@ def fuzzy_dedup(rows: list[dict], threshold: float = JACCARD_THRESHOLD) -> tuple
 VALIDATION_PROMPT = """\
 Is this a valid reading comprehension training example?
 Check: (1) Is the answer actually supported by the context?
-(2) Is the answer complete and well-phrased? (3) For tool calls, is the tool choice correct?
+(2) Is the answer complete and well-phrased?
 
 Context:
 {context}
-
-Tools: {tools}
 
 Conversation:
 {conversation}
@@ -343,17 +329,14 @@ async def _validate_one(row: dict, provider, cost, sem) -> tuple[str, bool | Non
     from data.scripts.generate_synthetic import extract_json
 
     conversation = "\n".join(f"{t['role'].upper()}: {t['content']}" for t in row.get("conversation", []))
-    tools_text = json.dumps(row.get("tools", []))[:200] if row.get("tools") else "none"
-
     prompt = VALIDATION_PROMPT.format(
       context=row.get("context", "")[:1500],
-      tools=tools_text,
       conversation=conversation[:1000],
     )
 
     try:
-      text, model, in_tok, out_tok = await provider.generate(prompt)
-      cost.record(model, in_tok, out_tok)
+      text, model, in_tok, out_tok, cache_read, cache_write = await provider.generate(prompt)
+      cost.record(model, in_tok, out_tok, cache_read, cache_write)
       parsed = extract_json(text)
 
       if isinstance(parsed, dict) and "valid" in parsed:
@@ -368,10 +351,13 @@ async def _run_llm_validation(
   rows: list[dict],
   sample_pct: float,
   provider_name: str,
-  model_name: str,
+  model_args: list[str] | None,
+  oss_backend: str | None,
   concurrency: int,
 ) -> dict:
-  from data.scripts.generate_synthetic import CostTracker, _load_dotenv, make_provider
+  from tqdm import tqdm
+
+  from data.scripts.generate_synthetic import CostTracker, _load_dotenv, _parse_model_args, make_provider
 
   _load_dotenv()
 
@@ -380,11 +366,48 @@ async def _run_llm_validation(
   sample = rng.sample(rows, min(n, len(rows)))
   log.info("LLM validation: %d / %d rows (%.1f%%)", len(sample), len(rows), sample_pct * 100)
 
-  provider = make_provider(provider_name, model=model_name)
+  model, models = _parse_model_args(model_args)
+  provider = make_provider(provider_name, model=model, models=models, oss_backend=oss_backend)
   cost = CostTracker()
   sem = asyncio.Semaphore(concurrency)
+  tasks = [asyncio.create_task(_validate_one(r, provider, cost, sem)) for r in sample]
+  results: list[tuple[str, bool | None]] = []
 
-  results = await asyncio.gather(*[_validate_one(r, provider, cost, sem) for r in sample])
+  class _TqdmHandler(logging.Handler):
+    """Routes log records through tqdm.write() so they don't break the bar."""
+
+    def __init__(self, formatter: logging.Formatter | None = None):
+      super().__init__()
+
+      if formatter:
+        self.setFormatter(formatter)
+
+    def emit(self, record: logging.LogRecord) -> None:
+      try:
+        tqdm.write(self.format(record), file=sys.stderr)
+      except Exception:
+        self.handleError(record)
+
+  root = logging.getLogger()
+
+  original_handlers = root.handlers[:]
+
+  fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+  tqdm_handler = _TqdmHandler(fmt)
+
+  tqdm_handler.setLevel(logging.WARNING)
+
+  root.handlers = [tqdm_handler]
+
+  try:
+    with tqdm(total=len(sample), desc="LLM validation", unit="row", file=sys.stderr) as pbar:
+      for task in asyncio.as_completed(tasks):
+        result = await task
+        results.append(result)
+        pbar.update(1)
+  finally:
+    root.handlers = original_handlers
 
   by_source: dict[str, dict[str, int]] = defaultdict(lambda: {"valid": 0, "invalid": 0, "error": 0})
 
@@ -468,7 +491,14 @@ def step_filter(args: argparse.Namespace) -> None:
 
   if args.llm_validate:
     report["llm_validation"] = asyncio.run(
-      _run_llm_validation(passing, args.sample_pct, args.llm_provider, args.llm_model, args.concurrency)
+      _run_llm_validation(
+        passing,
+        args.sample_pct,
+        args.llm_provider,
+        args.llm_model,
+        args.llm_oss_backend,
+        args.concurrency,
+      )
     )
   else:
     log.info("Skipping LLM validation (use --llm-validate to enable)")
@@ -511,7 +541,7 @@ def _print_filter_report(report: dict) -> None:
     _print("\n  LLM validation:")
 
     for src, v in report["llm_validation"]["per_source"].items():
-      flag = " *** FLAGGED ***" if v["flagged"] else ""
+      flag = " FLAGGED" if v["flagged"] else ""
       _print(f"    {src}: {v['pass_rate']:.1%} ({v['valid']}/{v['sampled']}){flag}")
 
   _print("\n  Top failure reasons:")
@@ -548,9 +578,6 @@ def step_tokenizer(args: argparse.Namespace) -> None:
 
       for turn in row.get("conversation", []):
         texts.append(turn["content"])
-
-      if row.get("tools"):
-        texts.append(json.dumps(row["tools"]))
 
   log.info("Collected %d text segments (%d unique passages)", len(texts), len(set(passages)))
 
@@ -637,11 +664,6 @@ def _pack_example(row: dict, tokenizer, sid: dict[str, int]) -> tuple[list[int],
   toks: list[int] = [sid["context"]]
   toks.extend(tokenizer.encode(row["context"]).ids)
 
-  toks.append(sid["tools"])
-
-  if row.get("tools"):
-    toks.extend(tokenizer.encode(json.dumps(row["tools"])).ids)
-
   for turn in row["conversation"]:
     role_id = sid["user"] if turn["role"] == "user" else sid["assistant"]
     toks.append(role_id)
@@ -659,7 +681,7 @@ def _pack_example(row: dict, tokenizer, sid: dict[str, int]) -> tuple[list[int],
   for i, t in enumerate(toks):
     if t == sid["assistant"]:
       in_asst = True
-    elif t in (sid["user"], sid["context"], sid["tools"]):
+    elif t in (sid["user"], sid["context"]):
       in_asst = False
     elif t == sid["eos"] or in_asst:
       mask[i] = 1
@@ -861,6 +883,8 @@ def step_process(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+  from data.scripts.generate_synthetic import OSS_BACKENDS, PROVIDER_CHOICES
+
   parser = argparse.ArgumentParser(
     description="Merge, filter, tokenize, and split all training data",
     formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -882,14 +906,33 @@ Steps:
     "Applied during the process step before tokenization. Rows are sampled deterministically.",
   )
   parser.add_argument("--llm-validate", action="store_true", help="Run LLM validation on a sample (costs $)")
-  parser.add_argument("--llm-provider", default="anthropic", choices=["anthropic", "openai"])
-  parser.add_argument("--llm-model", default="claude-sonnet-4-6")
+  parser.add_argument(
+    "--llm-provider",
+    default="anthropic",
+    choices=PROVIDER_CHOICES,
+    help="Provider for LLM validation (supports anthropic/openai/minimax/kimi/glm/round-robin)",
+  )
+  parser.add_argument(
+    "--llm-model",
+    action="append",
+    default=None,
+    help="Model override(s) for LLM validation. Plain value for single providers "
+    "(e.g. gpt-4o-mini). For round-robin use PROVIDER=MODEL (repeatable).",
+  )
+  parser.add_argument(
+    "--llm-oss-backend",
+    default=None,
+    choices=list(OSS_BACKENDS),
+    help="OSS backend for minimax/kimi/glm validation providers: baseten or together (auto-detect by default)",
+  )
   parser.add_argument("--sample-pct", type=float, default=0.05, help="LLM validation sample fraction (default: 0.05)")
   parser.add_argument("--concurrency", type=int, default=10)
 
   args = parser.parse_args()
 
   logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stderr)
+  logging.getLogger("httpx").setLevel(logging.WARNING)
+  logging.getLogger("httpcore").setLevel(logging.WARNING)
 
   steps = ["filter", "tokenizer", "process"] if args.step == "all" else [args.step]
 
