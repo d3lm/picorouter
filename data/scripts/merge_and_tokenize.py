@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import sys
 import time
 from collections import Counter, defaultdict
@@ -33,6 +34,8 @@ MODEL_DIR = ROOT / "model"
 TOKENIZER_PATH = MODEL_DIR / "tokenizer.json"
 
 REFUSAL_PHRASE = "I don't have enough information in the provided context"
+
+_CITATION_RE = re.compile(r"\s*\[source:[^\]]*\]\.?")
 
 SPECIAL_TOKENS = [
   "<|pad|>",
@@ -51,7 +54,9 @@ ALL_SOURCES = {
   "coqa": DATA_DIR / "open_datasets" / "coqa.jsonl",
   "drop": DATA_DIR / "open_datasets" / "drop.jsonl",
   "synthetic-tools": DATA_DIR / "synthetic" / "tools.clean.jsonl",
-  "synthetic-multiturn": DATA_DIR / "synthetic" / "multiturn.clean.jsonl",
+  "synthetic-tools-v2": DATA_DIR / "synthetic" / "tools_v2.clean.jsonl",
+  "synthetic-offtopic-refusal": DATA_DIR / "synthetic" / "offtopic_refusal.jsonl",
+  "synthetic-empty-context": DATA_DIR / "synthetic" / "empty_context.jsonl",
 }
 
 FILTERED_PATH = PROCESSED_DIR / "filtered.jsonl"
@@ -62,8 +67,36 @@ MAX_SEQ_LEN = 1024
 VOCAB_SIZE = 8192
 RANDOM_SEED = 42
 JACCARD_THRESHOLD = 0.85
+MAX_QUESTION_DUPLICATES = 10
 MIN_CONTEXT_WORDS = 20
 MAX_CONTEXT_WORDS = 800
+
+
+def strip_source_citations(rows: list[dict]) -> tuple[list[dict], int]:
+  """Remove [source: ...] citations from context-answer assistant turns."""
+  stripped = 0
+
+  for row in rows:
+    for turn in row.get("conversation", []):
+      if turn["role"] != "assistant":
+        continue
+
+      content = turn["content"]
+
+      if "<|tool_call|>" in content or "<|refuse|>" in content:
+        continue
+
+      cleaned = _CITATION_RE.sub("", content).strip()
+      cleaned = re.sub(r"  +", " ", cleaned)
+
+      if not cleaned:
+        continue
+
+      if cleaned != content:
+        turn["content"] = cleaned
+        stripped += 1
+
+  return rows, stripped
 
 
 def load_all_sources() -> list[dict]:
@@ -118,8 +151,14 @@ def _check_row(row: dict) -> list[str]:
 
   word_count = _count_words(row.get("context", ""))
 
-  if word_count < MIN_CONTEXT_WORDS or word_count > MAX_CONTEXT_WORDS:
-    errors.append(f"context {word_count} words outside [{MIN_CONTEXT_WORDS}, {MAX_CONTEXT_WORDS}]")
+  allows_empty_context = row.get("source") == "synthetic-empty-context"
+
+  if word_count > MAX_CONTEXT_WORDS:
+    errors.append(f"context {word_count} words exceeds {MAX_CONTEXT_WORDS}")
+    return errors
+
+  if not allows_empty_context and word_count < MIN_CONTEXT_WORDS:
+    errors.append(f"context {word_count} words below {MIN_CONTEXT_WORDS}")
     return errors
 
   conversation = row.get("conversation", [])
@@ -151,14 +190,8 @@ def _check_row(row: dict) -> list[str]:
       errors.append("empty assistant content")
       continue
 
-    is_refusal = content.startswith("<|refuse|>")
-    is_tool_call = "<|tool_call|>" in content
-
-    if is_refusal:
-      if REFUSAL_PHRASE.lower() not in content.lower():
-        errors.append("refusal missing standard phrase")
-    elif not is_tool_call and "[source:" not in content:
-      errors.append("context answer missing [source:]")
+    if content.startswith("<|refuse|>") and REFUSAL_PHRASE.lower() not in content.lower():
+      errors.append("refusal missing standard phrase")
 
   return errors
 
@@ -189,18 +222,42 @@ def run_automated_checks(rows: list[dict]) -> tuple[list[dict], dict]:
 
 
 def exact_dedup(rows: list[dict]) -> tuple[list[dict], int]:
-  """Exact-match dedup on (context, first_question). Returns (deduped, n_removed)."""
-  seen: set[tuple[str, str]] = set()
+  """Exact-match dedup on (context, first_question). Returns (deduped, n_removed).
+
+  For empty-context rows, the tools list is included in the key so that
+  the same question with different tool subsets is kept as distinct examples.
+  """
+  seen: set[tuple[str, ...]] = set()
   deduped: list[dict] = []
 
   for row in rows:
     conv = row.get("conversation", [])
-    key = (row.get("context", ""), conv[0].get("content", "") if conv else "")
+    ctx = row.get("context", "")
+    question = conv[0].get("content", "") if conv else ""
+    key = (ctx, question) if ctx else (ctx, question, json.dumps(row.get("tools", []), sort_keys=True))
 
     if key in seen:
       continue
 
     seen.add(key)
+    deduped.append(row)
+
+  return deduped, len(rows) - len(deduped)
+
+
+def question_cap_dedup(rows: list[dict], max_per_question: int = MAX_QUESTION_DUPLICATES) -> tuple[list[dict], int]:
+  """Cap identical questions to at most *max_per_question* examples, keeping diverse contexts."""
+  question_counts: Counter[str] = Counter()
+  deduped: list[dict] = []
+
+  for row in rows:
+    conv = row.get("conversation", [])
+    question = conv[0].get("content", "") if conv else ""
+
+    if question_counts[question] >= max_per_question:
+      continue
+
+    question_counts[question] += 1
     deduped.append(row)
 
   return deduped, len(rows) - len(deduped)
@@ -267,7 +324,7 @@ def fuzzy_dedup(rows: list[dict], threshold: float = JACCARD_THRESHOLD) -> tuple
 VALIDATION_PROMPT = """\
 Is this a valid reading comprehension training example?
 Check: (1) Is the answer actually supported by the context?
-(2) Is the citation accurate? (3) For tool calls, is the tool choice correct?
+(2) Is the answer complete and well-phrased? (3) For tool calls, is the tool choice correct?
 
 Context:
 {context}
@@ -372,6 +429,12 @@ def step_filter(args: argparse.Namespace) -> None:
 
   log.info("Total: %d rows", len(rows))
 
+  log.info("Stripping [source:] citations from context answers...")
+
+  rows, n_stripped = strip_source_citations(rows)
+
+  log.info("Stripped citations from %d assistant turns", n_stripped)
+
   log.info("Running automated quality checks...")
 
   passing, report = run_automated_checks(rows)
@@ -384,6 +447,14 @@ def step_filter(args: argparse.Namespace) -> None:
   report["exact_dedup_removed"] = exact_n
 
   log.info("Exact dedup removed %d (%d remaining)", exact_n, len(passing))
+
+  log.info("Question-cap dedup (max %d per question)...", MAX_QUESTION_DUPLICATES)
+
+  passing, question_cap_n = question_cap_dedup(passing, MAX_QUESTION_DUPLICATES)
+
+  report["question_cap_dedup_removed"] = question_cap_n
+
+  log.info("Question-cap dedup removed %d (%d remaining)", question_cap_n, len(passing))
 
   log.info("Fuzzy dedup (MinHash/LSH, threshold=%.2f)...", JACCARD_THRESHOLD)
 
@@ -426,6 +497,7 @@ def _print_filter_report(report: dict) -> None:
   _print(f"  Passed checks:       {report['passed_checks']:,}")
   _print(f"  Failed checks:       {report['failed_checks']:,}")
   _print(f"  Exact dedup removed: {report['exact_dedup_removed']:,}")
+  _print(f"  Question-cap dedup:  {report['question_cap_dedup_removed']:,}")
   _print(f"  Fuzzy dedup removed: {report['fuzzy_dedup_removed']:,}")
   _print(f"  After filtering:     {report['after_filtering']:,}")
   _print("\n  Per-source after filtering:")
@@ -601,6 +673,49 @@ def _pack_example(row: dict, tokenizer, sid: dict[str, int]) -> tuple[list[int],
   return toks, mask, actual_len
 
 
+def _parse_caps(raw: list[str] | None) -> dict[str, int]:
+  """Parse --cap SOURCE=N values into a dict."""
+  if not raw:
+    return {}
+
+  caps: dict[str, int] = {}
+
+  for entry in raw:
+    if "=" not in entry:
+      raise ValueError(f"Invalid --cap format: {entry!r} (expected SOURCE=N)")
+
+    source, _, count = entry.partition("=")
+    caps[source.strip()] = int(count.strip())
+
+  return caps
+
+
+def _apply_caps(rows: list[dict], caps: dict[str, int], seed: int = RANDOM_SEED) -> list[dict]:
+  """Deterministically sample rows per source to enforce caps."""
+  if not caps:
+    return rows
+
+  by_source: dict[str, list[dict]] = {}
+
+  for row in rows:
+    by_source.setdefault(row.get("source", "unknown"), []).append(row)
+
+  result: list[dict] = []
+  rng = random.Random(seed)
+
+  for source, source_rows in by_source.items():
+    cap = caps.get(source)
+
+    if cap is not None and len(source_rows) > cap:
+      log.info("  Capping %s: %d → %d", source, len(source_rows), cap)
+      sampled = rng.sample(source_rows, cap)
+      result.extend(sampled)
+    else:
+      result.extend(source_rows)
+
+  return result
+
+
 def step_process(args: argparse.Namespace) -> None:
   from tokenizers import Tokenizer
 
@@ -622,6 +737,28 @@ def step_process(args: argparse.Namespace) -> None:
 
     sid[tok.strip("<|>")] = tid
 
+  caps = _parse_caps(args.cap)
+
+  if caps:
+    log.info("Per-source caps: %s", caps)
+
+  log.info("Loading rows from %s...", FILTERED_PATH)
+
+  all_rows: list[dict] = []
+
+  with open(FILTERED_PATH, encoding="utf-8") as f:
+    for line in f:
+      line = line.strip()
+
+      if line:
+        all_rows.append(json.loads(line))
+
+  log.info("Loaded %d rows", len(all_rows))
+
+  if caps:
+    all_rows = _apply_caps(all_rows, caps)
+    log.info("After caps: %d rows", len(all_rows))
+
   log.info("Packing and tokenizing (max_seq_len=%d)...", MAX_SEQ_LEN)
 
   all_toks: list[list[int]] = []
@@ -630,28 +767,21 @@ def step_process(args: argparse.Namespace) -> None:
   source_counts: Counter[str] = Counter()
   discarded = 0
 
-  with open(FILTERED_PATH, encoding="utf-8") as f:
-    for n, line in enumerate(f, 1):
-      line = line.strip()
+  for n, row in enumerate(all_rows, 1):
+    result = _pack_example(row, tokenizer, sid)
 
-      if not line:
-        continue
+    if result is None:
+      discarded += 1
+      continue
 
-      row = json.loads(line)
-      result = _pack_example(row, tokenizer, sid)
+    t, m, alen = result
+    all_toks.append(t)
+    all_mask.append(m)
+    lengths.append(alen)
+    source_counts[row.get("source", "unknown")] += 1
 
-      if result is None:
-        discarded += 1
-        continue
-
-      t, m, alen = result
-      all_toks.append(t)
-      all_mask.append(m)
-      lengths.append(alen)
-      source_counts[row.get("source", "unknown")] += 1
-
-      if n % 50_000 == 0:
-        log.info("  %d rows...", n)
+    if n % 50_000 == 0:
+      log.info("  %d rows...", n)
 
   total = len(all_toks)
 
@@ -744,6 +874,13 @@ Steps:
   )
 
   parser.add_argument("--step", required=True, choices=["filter", "tokenizer", "process", "all"])
+  parser.add_argument(
+    "--cap",
+    action="append",
+    default=None,
+    help="Per-source row cap: SOURCE=N (repeatable, e.g. --cap squad2=45000 --cap drop=40000). "
+    "Applied during the process step before tokenization. Rows are sampled deterministically.",
+  )
   parser.add_argument("--llm-validate", action="store_true", help="Run LLM validation on a sample (costs $)")
   parser.add_argument("--llm-provider", default="anthropic", choices=["anthropic", "openai"])
   parser.add_argument("--llm-model", default="claude-sonnet-4-6")
