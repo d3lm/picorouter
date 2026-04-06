@@ -1,0 +1,116 @@
+[
+  {
+    "name": "calculator",
+    "description": "Evaluate a mathematical expression",
+    "parameters": {
+      "expression": { "type": "string", "description": "Math expression to evaluate, e.g. '2 + 3 * 4'" }
+    }
+  },
+  {
+    "name": "web_search",
+    "description": "Search the web for current information",
+    "parameters": {
+      "query": { "type": "string", "description": "Search query" }
+    }
+  },
+  {
+    "name": "get_current_date",
+    "description": "Get today's date and time",
+    "parameters": {}
+  },
+  {
+    "name": "get_weather",
+    "description": "Get current weather for a location",
+    "parameters": {
+      "location": { "type": "string", "description": "City name or location" }
+    }
+  },
+  {
+    "name": "unit_converter",
+    "description": "Convert between units of measurement",
+    "parameters": {
+      "value": { "type": "number", "description": "The numeric value to convert" },
+      "from_unit": { "type": "string", "description": "Source unit, e.g. 'miles'" },
+      "to_unit": { "type": "string", "description": "Target unit, e.g. 'kilometers'" }
+    }
+  },
+  {
+    "name": "define_word",
+    "description": "Look up the definition of a word",
+    "parameters": {
+      "word": { "type": "string", "description": "The word to define" }
+    }
+  },
+  {
+    "name": "translate",
+    "description": "Translate text between languages",
+    "parameters": {
+      "text": { "type": "string", "description": "Text to translate" },
+      "from_lang": { "type": "string", "description": "Source language, e.g. 'English'" },
+      "to_lang": { "type": "string", "description": "Target language, e.g. 'Spanish'" }
+    }
+  },
+  {
+    "name": "set_timer",
+    "description": "Set a countdown timer",
+    "parameters": {
+      "duration_seconds": { "type": "integer", "description": "Timer duration in seconds" },
+      "label": { "type": "string", "description": "Label for the timer" }
+    }
+  },
+  {
+    "name": "run_code",
+    "description": "Execute a snippet of Python code and return the output",
+    "parameters": {
+      "code": { "type": "string", "description": "Python code to execute" }
+    }
+  },
+  {
+    "name": "summarize",
+    "description": "Generate a concise summary of a long text",
+    "parameters": {
+      "text": { "type": "string", "description": "The text to summarize" },
+      "max_sentences": { "type": "integer", "description": "Maximum number of sentences in the summary" }
+    }
+  },
+  {
+    "name": "get_stock_price",
+    "description": "Get the current stock price for a ticker symbol",
+    "parameters": {
+      "symbol": { "type": "string", "description": "Stock ticker symbol, e.g. 'AAPL'" }
+    }
+  },
+  {
+    "name": "send_email",
+    "description": "Send an email to a recipient",
+    "parameters": {
+      "to": { "type": "string", "description": "Recipient email address" },
+      "subject": { "type": "string", "description": "Email subject line" },
+      "body": { "type": "string", "description": "Email body text" }
+    }
+  },
+  {
+    "name": "create_reminder",
+    "description": "Create a reminder for a future date and time",
+    "parameters": {
+      "message": { "type": "string", "description": "Reminder message" },
+      "datetime": { "type": "string", "description": "When to trigger the reminder, e.g. '2025-03-15 09:00'" }
+    }
+  },
+  {
+    "name": "get_directions",
+    "description": "Get driving or walking directions between two locations",
+    "parameters": {
+      "origin": { "type": "string", "description": "Starting location" },
+      "destination": { "type": "string", "description": "Destination location" },
+      "mode": { "type": "string", "description": "Travel mode: 'driving', 'walking', or 'transit'" }
+    }
+  },
+  {
+    "name": "lookup_contact",
+    "description": "Look up a person's contact information by name",
+    "parameters": {
+      "name": { "type": "string", "description": "Full or partial name to search for" }
+    }
+  }
+]

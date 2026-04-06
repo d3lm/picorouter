@@ -148,6 +148,15 @@ export interface ModelState {
   idToToken: Record<number, string>;
   specialTokens: Record<string, number>;
   mergeRanks: Map<string, number>;
+  tools: string;
+}
+
+function formatToolsPayload(raw: unknown): string {
+  if (!Array.isArray(raw)) {
+    return '';
+  }
+
+  return JSON.stringify(raw);
 }
 
 export async function loadModel(onStatus: (msg: string) => void): Promise<ModelState> {
@@ -201,9 +210,24 @@ export async function loadModel(onStatus: (msg: string) => void): Promise<ModelS
   }
 
   const vocabSize = Object.keys(vocab).length;
-  onStatus(`Model loaded (${vocabSize} vocab, ${rawMerges.length} merges)`);
 
-  return { session, vocab, idToToken, specialTokens, mergeRanks };
+  onStatus('Loading tool schemas…');
+
+  const toolsUrl = resolveAssetUrl('tool_schemas.json');
+  const toolsResponse = await fetch(toolsUrl);
+
+  let tools = '';
+
+  if (toolsResponse.ok) {
+    const toolsJson = (await toolsResponse.json()) as unknown;
+    tools = formatToolsPayload(toolsJson);
+  } else {
+    onStatus(`Tool schemas unavailable (${toolsResponse.status}) — continuing without tools`);
+  }
+
+  onStatus(`Model loaded (${vocabSize} vocab, ${rawMerges.length} merges, ${tools ? 'tools loaded' : 'no tools'})`);
+
+  return { session, vocab, idToToken, specialTokens, mergeRanks, tools };
 }
 
 export async function runInference(
@@ -212,15 +236,17 @@ export async function runInference(
   question: string,
   onStatus: (msg: string) => void,
 ): Promise<string> {
-  const { session, vocab, idToToken, specialTokens, mergeRanks } = model;
+  const { session, vocab, idToToken, specialTokens, mergeRanks, tools } = model;
 
   const contextIds = bpeEncode(context, vocab, mergeRanks);
+  const toolsIds = bpeEncode(tools, vocab, mergeRanks);
   const questionIds = bpeEncode(question, vocab, mergeRanks);
 
   const inputIds = [
     specialTokens['<|context|>'] ?? 2,
     ...contextIds,
     specialTokens['<|tools|>'] ?? 3,
+    ...toolsIds,
     specialTokens['<|user|>'] ?? 4,
     ...questionIds,
     specialTokens['<|assistant|>'] ?? 5,
