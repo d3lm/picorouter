@@ -110,15 +110,18 @@ def export(checkpoint_path: Path | None = None):
 
 def main():
   parser = argparse.ArgumentParser(description="Export PicoRouter to ONNX")
+
   parser.add_argument(
     "--checkpoint",
     type=str,
     default=None,
     help="Path to checkpoint directory (default: checkpoints/best)",
   )
+
   args = parser.parse_args()
 
   checkpoint_path = Path(args.checkpoint) if args.checkpoint else None
+
   export(checkpoint_path)
 
 

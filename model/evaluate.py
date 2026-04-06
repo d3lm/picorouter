@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 import torch
+from tqdm import tqdm
 
 from model.architecture import PicoConfig, PicoRouter
 from model.tokenizer import encode_example, load_tokenizer
@@ -34,10 +35,13 @@ DEFAULT_BATCH_SIZE = 32
 def get_device(override: str | None = None) -> torch.device:
   if override:
     return torch.device(override)
+
   if torch.cuda.is_available():
     return torch.device("cuda")
+
   if torch.backends.mps.is_available():
     return torch.device("mps")
+
   return torch.device("cpu")
 
 
@@ -47,9 +51,9 @@ def load_model(
   compile_model: bool = True,
 ) -> tuple[PicoRouter, PicoConfig]:
   with open(checkpoint_dir / "config.json") as config_file:
-    cfg = PicoConfig(**json.load(config_file))
+    config = PicoConfig(**json.load(config_file))
 
-  model = PicoRouter(cfg).to(device)
+  model = PicoRouter(config).to(device)
 
   weights_path = checkpoint_dir / "weights.pt"
   state_dict = torch.load(weights_path, map_location=device, weights_only=True)
@@ -60,7 +64,7 @@ def load_model(
     print("  Compiling model with torch.compile...")
     model = torch.compile(model)
 
-  return model, cfg
+  return model, config
 
 
 @torch.no_grad()
@@ -74,6 +78,7 @@ def generate(
   """Greedy autoregressive generation with KV-cache (single example)."""
   generated = []
   cache = None
+
   input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
 
   for _ in range(max_new_tokens):
@@ -100,6 +105,7 @@ def generate_batch(
   device: torch.device,
   max_new_tokens: int = 256,
   batch_size: int = DEFAULT_BATCH_SIZE,
+  desc: str = "Generating",
 ) -> list[list[int]]:
   """Batched greedy autoregressive generation with KV-cache.
 
@@ -109,14 +115,29 @@ def generate_batch(
   if not token_ids_list:
     return []
 
-  all_generated: list[list[int]] = []
+  max_seq_len = model.config.max_seq_len
+  indices: list[int] = []
+  filtered: list[list[int]] = []
 
-  for batch_start in range(0, len(token_ids_list), batch_size):
-    batch_tokens = token_ids_list[batch_start : batch_start + batch_size]
+  for i, toks in enumerate(token_ids_list):
+    if len(toks) < max_seq_len:
+      indices.append(i)
+      filtered.append(toks)
+
+  n_batches = (len(filtered) + batch_size - 1) // batch_size
+  gen_results: list[list[int]] = []
+
+  for batch_start in tqdm(range(0, len(filtered), batch_size), total=n_batches, desc=desc, unit="batch"):
+    batch_tokens = filtered[batch_start : batch_start + batch_size]
     gen = _generate_one_batch(model, batch_tokens, eos_id, device, max_new_tokens)
-    all_generated.extend(gen)
+    gen_results.extend(gen)
 
-  return all_generated
+  result: list[list[int]] = [[] for _ in token_ids_list]
+
+  for idx, gen in zip(indices, gen_results, strict=True):
+    result[idx] = gen
+
+  return result
 
 
 def _generate_one_batch(
@@ -131,8 +152,14 @@ def _generate_one_batch(
   if B == 0:
     return []
 
+  max_seq_len = model.config.max_seq_len
   prompt_lengths = [len(tokens) for tokens in batch_tokens]
   max_prompt_length = max(prompt_lengths)
+  max_new_tokens = min(max_new_tokens, max_seq_len - max_prompt_length)
+
+  if max_new_tokens <= 0:
+    return [[] for _ in range(B)]
+
   padding_lengths = [max_prompt_length - prompt_length for prompt_length in prompt_lengths]
 
   padded = torch.zeros(B, max_prompt_length, dtype=torch.long, device=device)
@@ -285,14 +312,14 @@ def build_prompt_tokens(tokenizer, example: dict) -> list[int]:
   if example.get("tools"):
     tokens.extend(tokenizer.encode(json.dumps(example["tools"])).ids)
 
-  conv = example["conversation"]
+  conversation = example["conversation"]
 
-  for i, turn in enumerate(conv):
+  for i, turn in enumerate(conversation):
     if turn["role"] == "user":
       tokens.append(user_id)
       tokens.extend(tokenizer.encode(turn["content"]).ids)
     elif turn["role"] == "assistant":
-      if i == len(conv) - 1:
+      if i == len(conversation) - 1:
         tokens.append(asst_id)
       else:
         tokens.append(asst_id)
@@ -355,7 +382,7 @@ def eval_extractive(
   subset = examples[:max_examples]
 
   prompts = [build_prompt_tokens(tokenizer, example) for example in subset]
-  all_gen_ids = generate_batch(model, prompts, eos_id, device, batch_size=batch_size)
+  all_gen_ids = generate_batch(model, prompts, eos_id, device, batch_size=batch_size, desc="[1/5] Extractive")
 
   f1_scores, exact_match_scores = [], []
 
@@ -435,7 +462,7 @@ def eval_tool_accuracy(
   tool_subset = tool_examples[:max_examples]
 
   prompts = [build_prompt_tokens(tokenizer, ex) for ex in tool_subset]
-  all_gen_ids = generate_batch(model, prompts, eos_id, device, batch_size=batch_size)
+  all_gen_ids = generate_batch(model, prompts, eos_id, device, batch_size=batch_size, desc="[2/5] Tool-call")
 
   routing_correct = 0
   name_correct = 0
@@ -497,7 +524,7 @@ def eval_refusal(
   refusal_subset = refusal_examples[:max_examples]
 
   prompts = [build_prompt_tokens(tokenizer, ex) for ex in refusal_subset]
-  all_gen_ids = generate_batch(model, prompts, eos_id, device, batch_size=batch_size)
+  all_gen_ids = generate_batch(model, prompts, eos_id, device, batch_size=batch_size, desc="[3/5] Refusal")
 
   correct_refusals = 0
 
@@ -578,7 +605,7 @@ def eval_hallucination(
   adversarial = build_adversarial_examples(all_examples, n=n_probes)
 
   prompts = [build_prompt_tokens(tokenizer, ex) for ex in adversarial]
-  all_gen_ids = generate_batch(model, prompts, eos_id, device, batch_size=batch_size)
+  all_gen_ids = generate_batch(model, prompts, eos_id, device, batch_size=batch_size, desc="[4/5] Hallucination")
 
   hallucinations = 0
 
@@ -629,9 +656,11 @@ def eval_latency(
 
     for _ in range(n_trials):
       cache = None
+
       input_ids = torch.tensor([prompt], dtype=torch.long, device=device)
 
       _sync_device(device)
+
       t0 = time.perf_counter()
 
       logits, cache = model(input_ids, cache)
@@ -696,15 +725,16 @@ def find_checkpoints() -> list[Path]:
 
 def composite_score(report: dict) -> float:
   f1 = report.get("extractive", {}).get("mean_f1", 0)
-  tool_acc = report.get("tool_calling", {}).get("full_match_accuracy", 0)
+  tool_accuracy = report.get("tool_calling", {}).get("full_match_accuracy", 0)
   refusal = report.get("refusal", {}).get("correct_refusal_rate", 0)
-  halluc = report.get("hallucination", {}).get("hallucination_rate", 1)
-  return 0.4 * f1 + 0.3 * tool_acc + 0.2 * refusal + 0.1 * (1 - halluc)
+  hallucination = report.get("hallucination", {}).get("hallucination_rate", 1)
+  return 0.3 * f1 + 0.3 * tool_accuracy + 0.2 * refusal + 0.2 * (1 - hallucination)
 
 
 def select_best_checkpoint(reports: dict[str, dict]) -> str | None:
   if not reports:
     return None
+
   return max(reports, key=lambda k: composite_score(reports[k]))
 
 
@@ -740,7 +770,7 @@ def run_evaluation(
   print(f"\n[0/5] Pre-generating RC false-positive predictions (N={len(rc_fp_subset)})...")
 
   rc_fp_prompts = [build_prompt_tokens(tokenizer, ex) for ex in rc_fp_subset]
-  rc_fp_gen_ids = generate_batch(model, rc_fp_prompts, eos_id, device, batch_size=batch_size)
+  rc_fp_gen_ids = generate_batch(model, rc_fp_prompts, eos_id, device, batch_size=batch_size, desc="[0/5] RC FP")
   rc_fp_predictions = [tokenizer.decode(ids) for ids in rc_fp_gen_ids]
 
   print("       done")
@@ -949,14 +979,14 @@ def main():
       import shutil
 
       best_src = CHECKPOINT_DIR / best_name
-      best_dst = CHECKPOINT_DIR / "best"
+      best_dest = CHECKPOINT_DIR / "best"
 
-      if best_dst.exists():
-        shutil.rmtree(best_dst)
+      if best_dest.exists():
+        shutil.rmtree(best_dest)
 
-      shutil.copytree(best_src, best_dst)
+      shutil.copytree(best_src, best_dest)
 
-      print(f"Copied to {best_dst}")
+      print(f"Copied to {best_dest}")
 
       final_report = all_reports[best_name]
       final_report["all_scores"] = {k: round(composite_score(v), 4) for k, v in all_reports.items()}

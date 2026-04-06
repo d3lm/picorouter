@@ -20,6 +20,7 @@ dependencies = [
   "nltk>=3.9",
   "datasketch>=1.6",
   "onnxscript>=0.6.2",
+  "tqdm>=4.67.3",
 ]
 
 [project.optional-dependencies]
