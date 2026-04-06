@@ -72,7 +72,7 @@ def format_grounded_answer(example_id: str, context: str, answer_text: str) -> s
   if first_word.lower() in LOWERCASE_STARTERS:
     sentence = sentence[0].lower() + sentence[1:]
 
-  return f"{prefix}{sentence}. [source: paragraph 1]"
+  return f"{prefix}{sentence}."
 
 
 def convert_squad2(output_path: Path) -> dict:

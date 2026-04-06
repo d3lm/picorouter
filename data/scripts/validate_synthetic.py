@@ -1,4 +1,4 @@
-"""Validate synthetic training data files produced by generate_synthetic.py.
+"""Validate synthetic tool-calling data files produced by generate_synthetic.py.
 
 Runs structural and semantic checks on JSONL output, reporting errors
 (hard failures that indicate data corruption) and warnings (soft issues
@@ -6,17 +6,12 @@ worth investigating at scale).
 
 Usage:
   uv run python -m data.scripts.validate_synthetic \
-    --mode tools \
     --input data/synthetic/tools.jsonl
-
-  uv run python -m data.scripts.validate_synthetic \
-    --mode multiturn \
-    --input data/synthetic/multiturn.jsonl
 
 Can also be called programmatically:
 
   from data.scripts.validate_synthetic import validate
-  report = validate(Path("data/synthetic/tools.jsonl"), mode="tools")
+  report = validate(Path("data/synthetic/tools.jsonl"))
   report.print()
   assert report.ok
 """
@@ -31,46 +26,19 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import nltk
+from nltk.corpus import stopwords
+
 log = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOL_SCHEMAS_PATH = ROOT / "data" / "tool_schemas.json"
 
 REFUSAL_PHRASE = "I don't have enough information in the provided context"
-STOP_WORDS = frozenset(
-  [
-    "the",
-    "a",
-    "an",
-    "is",
-    "are",
-    "was",
-    "were",
-    "in",
-    "on",
-    "at",
-    "to",
-    "of",
-    "and",
-    "or",
-    "it",
-    "that",
-    "this",
-    "for",
-    "with",
-    "as",
-    "by",
-    "from",
-    "be",
-    "has",
-    "have",
-    "had",
-    "not",
-    "but",
-    "can",
-    "do",
-  ]
-)
+
+nltk.download("stopwords", quiet=True)
+
+STOP_WORDS = frozenset(stopwords.words("english"))
 
 
 @dataclass
@@ -148,26 +116,36 @@ class ValidationReport:
     write(f"RESULT: {status} ({len(self.errors)} errors, {len(self.warnings)} warnings)\n")
 
 
-def _load_canonical_tools() -> tuple[list[dict], str]:
+def _load_canonical_tools() -> tuple[list[dict], dict[str, str]]:
   with open(TOOL_SCHEMAS_PATH, encoding="utf-8") as file:
     schemas = json.load(file)
 
-  return schemas, json.dumps(schemas, sort_keys=True)
+  canonical_by_name = {s["name"]: json.dumps(s, sort_keys=True) for s in schemas}
+
+  return schemas, canonical_by_name
 
 
 def _validate_tools_row(
   row: dict,
   lineno: int,
-  canonical_json: str,
+  canonical_by_name: dict[str, str],
   schema_names: set[str],
   schema_params: dict[str, set[str]],
   report: ValidationReport,
 ) -> str | None:
   """Validate a single row from --mode tools output."""
-  row_tools_json = json.dumps(row.get("tools", []), sort_keys=True)
+  row_tools = row.get("tools", [])
 
-  if row_tools_json != canonical_json:
-    report.errors.append(f"L{lineno}: tools array doesn't match canonical tool_schemas.json")
+  if not isinstance(row_tools, list) or len(row_tools) == 0:
+    report.errors.append(f"L{lineno}: tools array is empty or not a list")
+  else:
+    for tool in row_tools:
+      name = tool.get("name")
+
+      if name not in canonical_by_name:
+        report.errors.append(f"L{lineno}: unknown tool '{name}' not in tool_schemas.json")
+      elif json.dumps(tool, sort_keys=True) != canonical_by_name[name]:
+        report.errors.append(f"L{lineno}: tool '{name}' schema doesn't match tool_schemas.json")
 
   conversation = row.get("conversation", [])
 
@@ -226,15 +204,8 @@ def _validate_tools_row(
 
     if missing:
       report.warnings.append(f"L{lineno}: tool '{tool_call['name']}' missing params: {missing}")
-
-    if "[source:" in assistant_response:
-      report.warnings.append(f"L{lineno}: tool_call also contains [source:] citation")
   else:
     report.context_answers += 1
-
-    if "[source:" not in assistant_response:
-      report.errors.append(f"L{lineno}: context_answer missing [source:] citation")
-
     context = row.get("context", "")
     context_words = set(context.lower().split()) - STOP_WORDS
     answer_words = set(assistant_response.lower().split()) - STOP_WORDS
@@ -245,77 +216,20 @@ def _validate_tools_row(
   return user_question
 
 
-def _validate_multiturn_row(row: dict, lineno: int, report: ValidationReport) -> None:
-  """Validate a single row from --mode multiturn output."""
-  conversation = row.get("conversation", [])
-
-  if not isinstance(conversation, list) or len(conversation) < 4:
-    report.errors.append(
-      f"L{lineno}: conversation should have >=4 turns, got {len(conversation) if isinstance(conversation, list) else 0}"
-    )
-
-    return
-
-  if len(conversation) % 2 != 0:
-    report.warnings.append(
-      f"L{lineno}: odd number of turns ({len(conversation)}), expected even (user/assistant pairs)"
-    )
-
-  for index, turn in enumerate(conversation):
-    if "role" not in turn or "content" not in turn:
-      report.errors.append(f"L{lineno}: turn {index} missing 'role' or 'content'")
-      continue
-
-    expected_role = "user" if index % 2 == 0 else "assistant"
-    if turn["role"] != expected_role:
-      report.errors.append(f"L{lineno}: turn {index} role is '{turn['role']}', expected '{expected_role}'")
-
-  has_refusal = any(
-    turn.get("role") == "assistant" and REFUSAL_PHRASE.lower() in turn.get("content", "").lower()
-    for turn in conversation
-  )
-
-  has_citation = any(turn.get("role") == "assistant" and "[source:" in turn.get("content", "") for turn in conversation)
-
-  has_refuse_tag = any(
-    turn.get("role") == "assistant" and turn.get("content", "").startswith("<|refuse|>") for turn in conversation
-  )
-
-  if not has_citation:
-    report.errors.append(f"L{lineno}: no assistant turn contains a [source:] citation")
-
-  if not has_refusal:
-    report.errors.append(f"L{lineno}: no assistant turn contains the refusal phrase")
-
-  if has_refusal and not has_refuse_tag:
-    report.errors.append(f"L{lineno}: refusal turn missing <|refuse|> prefix")
-
-  tools = row.get("tools", [])
-
-  if tools:
-    report.warnings.append(f"L{lineno}: multiturn row has non-empty tools array")
-
-
-def validate(input_path: Path, mode: str) -> ValidationReport:
+def validate(input_path: Path) -> ValidationReport:
   """Run all validation checks against a synthetic data JSONL file.
 
   Returns a ValidationReport with errors and warnings.
   """
   report = ValidationReport()
 
-  canonical_schemas = None
-  canonical_json = None
-  schema_names: set[str] = set()
-  schema_params: dict[str, set[str]] = {}
+  if not TOOL_SCHEMAS_PATH.exists():
+    report.errors.append(f"Tool schemas file not found: {TOOL_SCHEMAS_PATH}")
+    return report
 
-  if mode == "tools":
-    if not TOOL_SCHEMAS_PATH.exists():
-      report.errors.append(f"Tool schemas file not found: {TOOL_SCHEMAS_PATH}")
-      return report
-
-    canonical_schemas, canonical_json = _load_canonical_tools()
-    schema_names = {schema["name"] for schema in canonical_schemas}
-    schema_params = {schema["name"]: set(schema.get("parameters", {}).keys()) for schema in canonical_schemas}
+  canonical_schemas, canonical_by_name = _load_canonical_tools()
+  schema_names = {schema["name"] for schema in canonical_schemas}
+  schema_params = {schema["name"]: set(schema.get("parameters", {}).keys()) for schema in canonical_schemas}
 
   if not input_path.exists():
     report.errors.append(f"Input file not found: {input_path}")
@@ -343,10 +257,8 @@ def validate(input_path: Path, mode: str) -> ValidationReport:
         if key not in row:
           report.errors.append(f"L{lineno}: missing required key '{key}'")
 
-      expected_source = f"synthetic-{mode}"
-
-      if row.get("source") != expected_source:
-        report.errors.append(f"L{lineno}: source is '{row.get('source')}', expected '{expected_source}'")
+      if row.get("source") != "synthetic-tools":
+        report.errors.append(f"L{lineno}: source is '{row.get('source')}', expected 'synthetic-tools'")
 
       context = row.get("context", "")
 
@@ -357,42 +269,37 @@ def validate(input_path: Path, mode: str) -> ValidationReport:
 
       contexts.add(context[:200])
 
-      if mode == "tools":
-        question = _validate_tools_row(row, lineno, canonical_json, schema_names, schema_params, report)
+      question = _validate_tools_row(row, lineno, canonical_by_name, schema_names, schema_params, report)
 
-        if question:
-          all_questions.append(question)
-      elif mode == "multiturn":
-        _validate_multiturn_row(row, lineno, report)
+      if question:
+        all_questions.append(question)
 
   report.unique_contexts = len(contexts)
 
-  if mode == "tools":
-    question_counts = collections.Counter(all_questions)
-    report.duplicate_questions = {question: count for question, count in question_counts.items() if count > 1}
+  question_counts = collections.Counter(all_questions)
+  report.duplicate_questions = {question: count for question, count in question_counts.items() if count > 1}
 
-    if report.duplicate_questions:
-      report.warnings.append(f"{len(report.duplicate_questions)} duplicate question(s)")
+  if report.duplicate_questions:
+    report.warnings.append(f"{len(report.duplicate_questions)} duplicate question(s)")
 
-    if report.total > 0:
-      tool_call_ratio = report.tool_calls / report.total
+  if report.total > 0:
+    tool_call_ratio = report.tool_calls / report.total
 
-      if not (0.45 <= tool_call_ratio <= 0.70):
-        report.warnings.append(f"Tool-call ratio {tool_call_ratio:.1%} is outside expected range [45%-70%]")
+    if not (0.45 <= tool_call_ratio <= 0.70):
+      report.warnings.append(f"Tool-call ratio {tool_call_ratio:.1%} is outside expected range [45%-70%]")
 
-    if report.unique_contexts > 0:
-      avg_yield = report.total / report.unique_contexts
+  if report.unique_contexts > 0:
+    avg_yield = report.total / report.unique_contexts
 
-      if avg_yield < 6.5:
-        report.warnings.append(
-          f"Average yield {avg_yield:.1f} examples/context is below 7 (some LLM responses may have been filtered)"
-        )
+    if avg_yield < 6.5:
+      report.warnings.append(
+        f"Average yield {avg_yield:.1f} examples/context is below 7 (some LLM responses may have been filtered)"
+      )
 
-    if canonical_schemas:
-      unused = schema_names - set(report.tools_used.keys())
+  unused = schema_names - set(report.tools_used.keys())
 
-      if unused:
-        report.warnings.append(f"Unused tools: {unused}")
+  if unused:
+    report.warnings.append(f"Unused tools: {unused}")
 
   progress_path = input_path.with_suffix(".progress.jsonl")
   errors_path = input_path.with_suffix(".errors.jsonl")
@@ -422,14 +329,13 @@ def main() -> None:
     formatter_class=argparse.RawDescriptionHelpFormatter,
   )
 
-  parser.add_argument("--mode", required=True, choices=["tools", "multiturn"], help="Data mode to validate")
   parser.add_argument("--input", required=True, type=Path, help="JSONL file to validate")
 
   args = parser.parse_args()
 
   logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stderr)
 
-  report = validate(args.input, args.mode)
+  report = validate(args.input)
 
   report.print()
 

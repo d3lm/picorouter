@@ -1,28 +1,28 @@
-"""Generate synthetic training data via LLM APIs.
+"""Generate synthetic tool-calling training data via LLM APIs.
 
-Supports tool-calling and multi-turn conversation generation using
-Anthropic, OpenAI, MiniMax, Kimi, and GLM as providers.  All providers
-use prompt caching (Anthropic via explicit cache_control, OpenAI-compatible
-APIs via automatic prefix caching) to reduce input token costs.
+Supports Anthropic, OpenAI, MiniMax, Kimi, and GLM as providers.
+All providers use prompt caching (Anthropic via explicit cache_control,
+OpenAI-compatible APIs via automatic prefix caching) to reduce input
+token costs.
+
+OSS models (MiniMax, Kimi, GLM) can be served via Baseten or Together AI.
+Use --oss-backend to choose (by default uses auto-detect from available
+API keys, preferring TOGETHER_API_KEY over BASETEN_API_KEY).
+
+Each passage receives a random subset of available tools (controlled by
+--min-tools / --max-tools) so the model learns to select tools based on
+what's available rather than memorizing a fixed tool list.
 
 Usage:
   uv run python -m data.scripts.generate_synthetic \
-    --mode tools \
     --input data/sources/simplewiki_passages.jsonl \
     --output data/synthetic/tools.jsonl \
     --provider minimax \
+    --oss-backend together \
     --concurrency 10 \
-    --limit 12000
-
-  uv run python -m data.scripts.generate_synthetic \
-    --mode multiturn \
-    --input data/sources/simplewiki_passages.jsonl \
-    --output data/synthetic/multiturn.jsonl \
-    --provider round-robin \
-    --model anthropic=claude-haiku-4-5 \
-    --model minimax=minimax-m2.5 \
-    --concurrency 10 \
-    --limit 20000
+    --limit 10000 \
+    --min-tools 3 \
+    --max-tools 6
 """
 
 from __future__ import annotations
@@ -64,7 +64,46 @@ PRICING = {
   "kimi-k2.5": {"input": 0.60 / 1e6, "output": 2.00 / 1e6, "cache_read": 0.10 / 1e6},
   # GLM / Zhipu
   "glm-5": {"input": 0.72 / 1e6, "output": 2.30 / 1e6},
+  # Together AI
+  "MiniMaxAI/MiniMax-M2.5": {"input": 0.30 / 1e6, "output": 1.20 / 1e6},
+  "moonshotai/Kimi-K2.5": {"input": 0.50 / 1e6, "output": 2.80 / 1e6},
+  "zai-org/GLM-5": {"input": 1.00 / 1e6, "output": 3.20 / 1e6},
 }
+
+OSS_BACKENDS: dict[str, dict[str, str]] = {
+  "baseten": {
+    "base_url": "https://inference.baseten.co/v1",
+    "api_key_env": "BASETEN_API_KEY",
+  },
+  "together": {
+    "base_url": "https://api.together.xyz/v1",
+    "api_key_env": "TOGETHER_API_KEY",
+  },
+}
+
+
+def _resolve_oss_backend(backend: str | None = None) -> tuple[str, str]:
+  """Return (base_url, api_key) for the chosen OSS inference backend.
+
+  When *backend* is None, auto-detects from available env vars
+  (prefers TOGETHER_API_KEY, then BASETEN_API_KEY).
+  """
+  if backend is not None:
+    config = OSS_BACKENDS[backend]
+    return config["base_url"], os.environ.get(config["api_key_env"], "")
+
+  for name in ("together", "baseten"):
+    config = OSS_BACKENDS[name]
+
+    key = os.environ.get(config["api_key_env"])
+
+    if key:
+      log.info("Auto-detected OSS backend: %s", name)
+      return config["base_url"], key
+
+  config = OSS_BACKENDS["baseten"]
+
+  return config["base_url"], ""
 
 
 @dataclass
@@ -290,6 +329,9 @@ class OpenAICompatibleProvider(LLMProvider):
         log.warning("%s rate limit, retrying in %.1fs (attempt %d/6)", self.model, wait, attempt + 1)
         await asyncio.sleep(wait)
       except openai.APIStatusError as exc:
+        if exc.status_code == 404:
+          log.error("%s 404 response: %s", self.model, exc.response.text)
+          raise
         if exc.status_code >= 500:
           wait = min(2**attempt + random.random(), 60)
           log.warning("%s %d error, retrying in %.1fs", self.model, exc.status_code, wait)
@@ -306,51 +348,67 @@ class OpenAIProvider(OpenAICompatibleProvider):
 
 
 class MiniMaxProvider(OpenAICompatibleProvider):
-  def __init__(self, model: str | None = None):
+  def __init__(self, model: str | None = None, oss_backend: str | None = None):
+    base_url, api_key = _resolve_oss_backend(oss_backend)
+
     super().__init__(
       model=model or DEFAULT_MODELS["minimax"],
-      base_url="https://inference.baseten.co/v1",
-      api_key=os.environ.get("BASETEN_API_KEY", ""),
+      base_url=base_url,
+      api_key=api_key,
     )
 
 
 class KimiProvider(OpenAICompatibleProvider):
-  def __init__(self, model: str | None = None):
+  def __init__(self, model: str | None = None, oss_backend: str | None = None):
+    base_url, api_key = _resolve_oss_backend(oss_backend)
+
     super().__init__(
       model=model or DEFAULT_MODELS["kimi"],
-      base_url="https://inference.baseten.co/v1",
-      api_key=os.environ.get("BASETEN_API_KEY", ""),
+      base_url=base_url,
+      api_key=api_key,
     )
 
 
 class GLMProvider(OpenAICompatibleProvider):
-  def __init__(self, model: str | None = None):
+  def __init__(self, model: str | None = None, oss_backend: str | None = None):
+    base_url, api_key = _resolve_oss_backend(oss_backend)
+
     super().__init__(
       model=model or DEFAULT_MODELS["glm"],
-      base_url="https://inference.baseten.co/v1",
-      api_key=os.environ.get("BASETEN_API_KEY", ""),
+      base_url=base_url,
+      api_key=api_key,
     )
 
 
 class RoundRobinProvider(LLMProvider):
   """Alternates between available providers to stay under per-provider rate limits."""
 
-  def __init__(self, models: dict[str, str] | None = None):
+  def __init__(self, models: dict[str, str] | None = None, oss_backend: str | None = None):
     self._providers: list[LLMProvider] = []
     self._idx = 0
     models = models or {}
 
+    oss_env_key = "TOGETHER_API_KEY" if os.environ.get("TOGETHER_API_KEY") else "BASETEN_API_KEY"
+
+    if oss_backend:
+      oss_env_key = OSS_BACKENDS[oss_backend]["api_key_env"]
+
     provider_env_keys: list[tuple[str, type[LLMProvider], str]] = [
       ("ANTHROPIC_API_KEY", AnthropicProvider, "anthropic"),
       ("OPENAI_API_KEY", OpenAIProvider, "openai"),
-      ("BASETEN_API_KEY", MiniMaxProvider, "minimax"),
-      ("BASETEN_API_KEY", KimiProvider, "kimi"),
-      ("BASETEN_API_KEY", GLMProvider, "glm"),
+      (oss_env_key, MiniMaxProvider, "minimax"),
+      (oss_env_key, KimiProvider, "kimi"),
+      (oss_env_key, GLMProvider, "glm"),
     ]
 
     for env_key, cls, name in provider_env_keys:
       if os.environ.get(env_key):
-        self._providers.append(cls(model=models.get(name)))
+        kwargs: dict[str, Any] = {"model": models.get(name)}
+
+        if cls in (MiniMaxProvider, KimiProvider, GLMProvider):
+          kwargs["oss_backend"] = oss_backend
+
+        self._providers.append(cls(**kwargs))
 
     if not self._providers:
       raise RuntimeError("Round-robin requires at least one provider API key in env")
@@ -400,17 +458,29 @@ PROVIDER_FACTORIES: dict[str, type[LLMProvider]] = {
   "glm": GLMProvider,
 }
 
+OSS_PROVIDERS = {"minimax", "kimi", "glm"}
+
 PROVIDER_CHOICES = [*PROVIDER_FACTORIES, "round-robin"]
 
 
-def make_provider(name: str, model: str | None = None, models: dict[str, str] | None = None) -> LLMProvider:
+def make_provider(
+  name: str,
+  model: str | None = None,
+  models: dict[str, str] | None = None,
+  oss_backend: str | None = None,
+) -> LLMProvider:
   if name == "round-robin":
-    return RoundRobinProvider(models=models)
+    return RoundRobinProvider(models=models, oss_backend=oss_backend)
 
   if name not in PROVIDER_FACTORIES:
     raise ValueError(f"Unknown provider: {name}. Choose from: {', '.join(PROVIDER_CHOICES)}")
 
-  return PROVIDER_FACTORIES[name](model=model)
+  kwargs: dict[str, Any] = {"model": model}
+
+  if name in OSS_PROVIDERS:
+    kwargs["oss_backend"] = oss_backend
+
+  return PROVIDER_FACTORIES[name](**kwargs)
 
 
 def extract_json(text: str) -> Any:
@@ -433,8 +503,8 @@ def extract_json(text: str) -> Any:
 
 TOOLS_SYSTEM_PROMPT = """\
 You are generating training data for a model that can either answer from context
-or call tools. Given a context passage provided by the user and the available
-tools below, generate exactly 7 examples:
+or call tools. The user will provide a context passage and a set of available
+tools. Generate exactly 7 examples:
 
 - 4 questions where the correct response is a tool_call (the context does NOT contain the answer, but a tool can help)
 - 3 questions where the answer IS in the context (no tool needed)
@@ -444,12 +514,26 @@ CRITICAL RULES:
   If ANY part of the context addresses the question, it MUST be a context_answer, not a tool_call.
 - Tool-call questions should be things a user might naturally ask that genuinely require
   external data (live weather, calculations, translations) — not questions the passage covers.
+- ONLY use tools that appear in the user-provided tool list. Do NOT invent tools.
+
+TOOL-CALL QUALITY RULES:
+- Tool-call questions must be plausible in the real world. Do NOT look up contacts
+  or send emails to historical figures, fictional characters, or entities that
+  obviously cannot have contact information.
+- For send_email, the user should provide or clearly imply a real recipient.
+  Do NOT fabricate email addresses. If no address is specified, the question
+  should make it clear who the recipient is (e.g. "my colleague", "the team").
+- For get_stock_price, only use real, well-known ticker symbols. Do NOT guess
+  symbols for entities that are not publicly traded companies.
+- Do NOT use run_code for questions answerable from the context.
+- Do NOT use run_code to simply print a hardcoded string — that is never valid.
+- run_code is for genuine computation (math, date arithmetic, data processing),
+  not for listing or counting items already in the passage.
+- Prefer calculator for simple arithmetic instead of run_code.
 
 For tool calls, the response must be a JSON object: {{"tool_call": {{"name": "...", "arguments": {{...}}}}}}
-For context answers, respond with a grounded answer citing the context with [source: sentence N].
 
-Available tools:
-{tool_schemas_json}
+For context answers, respond with a clear, natural answer grounded in the passage. Do not cite sentence numbers.
 
 Respond with ONLY a JSON array (no other text):
 [
@@ -461,11 +545,16 @@ Respond with ONLY a JSON array (no other text):
   {{
     "question": "...",
     "response_type": "context_answer",
-    "response": "Based on the context, ... [source: sentence N]"
+    "response": "The answer is ..."
   }}
 ]"""
 
-TOOLS_USER_PROMPT = "Context:\n{passage_text}"
+TOOLS_USER_PROMPT = """\
+Context:
+{passage_text}
+
+Available tools:
+{tool_schemas_json}"""
 
 
 def _load_tool_schemas() -> list[dict]:
@@ -533,7 +622,7 @@ def process_tools_response(
         }
       )
     elif rtype == "context_answer":
-      if isinstance(response, str) and "[source:" in response:
+      if isinstance(response, str) and len(response.strip()) > 0:
         examples.append(
           {
             "context": passage["text"],
@@ -549,84 +638,18 @@ def process_tools_response(
   return examples
 
 
-MULTITURN_SYSTEM_PROMPT = """\
-You are generating training data for a conversational reading comprehension model.
-Given a document provided by the user, simulate a realistic 4-6 turn conversation
-between a user and an assistant.
-
-Rules:
-- The assistant ALWAYS grounds responses in the document with [source: sentence N] citations
-- Include follow-up questions that refer to earlier answers ("you mentioned...",
-  "what about the other...", "can you elaborate on...")
-- Include at least ONE turn where the user asks something NOT in the document —
-  the assistant should respond: "I don't have enough information in the provided
-  context to answer that question."
-- Make the conversation feel natural, not like a quiz
-
-Respond with ONLY a JSON array of conversation turns (no other text):
-[
-  {{"role": "user", "content": "..."}},
-  {{"role": "assistant", "content": "..."}},
-  {{"role": "user", "content": "..."}},
-  {{"role": "assistant", "content": "..."}},
-  ...
-]"""
-
-MULTITURN_USER_PROMPT = "Document:\n{passage_text}"
-
-REFUSAL_PHRASE = "I don't have enough information in the provided context"
-
-
-def process_multiturn_response(raw: list[dict], passage: dict) -> dict | None:
-  """Convert parsed LLM response into unified training format for multiturn mode."""
-  if len(raw) < 4:
-    return None
-
-  for i, turn in enumerate(raw):
-    if "role" not in turn or "content" not in turn:
-      return None
-
-    expected_role = "user" if i % 2 == 0 else "assistant"
-
-    if turn["role"] != expected_role:
-      return None
-
-  has_refusal = any(turn["role"] == "assistant" and REFUSAL_PHRASE.lower() in turn["content"].lower() for turn in raw)
-
-  has_citation = any(turn["role"] == "assistant" and "[source:" in turn["content"] for turn in raw)
-
-  if not has_refusal or not has_citation:
-    return None
-
-  conversation = []
-
-  for turn in raw:
-    content = turn["content"]
-
-    if turn["role"] == "assistant" and REFUSAL_PHRASE.lower() in content.lower():
-      content = f"<|refuse|>{content}"
-
-    conversation.append({"role": turn["role"], "content": content})
-
-  return {
-    "context": passage["text"],
-    "tools": [],
-    "conversation": conversation,
-    "source": "synthetic-multiturn",
-  }
-
-
 async def process_passage(
   passage: dict,
-  mode: str,
   provider: LLMProvider,
   cost: CostTracker,
   progress: ProgressTracker,
   output_file,
   write_lock: asyncio.Lock,
-  tool_schemas: list[dict] | None,
+  tool_schemas: list[dict],
   errors_file,
-  system_prompt: str | None,
+  system_prompt: str,
+  min_tools: int = 3,
+  max_tools: int = 6,
 ) -> int:
   """Process a single passage. Returns number of examples written."""
   pid = passage["id"]
@@ -634,10 +657,13 @@ async def process_passage(
   if progress.is_done(pid):
     return 0
 
-  if mode == "tools":
-    user_prompt = TOOLS_USER_PROMPT.format(passage_text=passage["text"])
-  else:
-    user_prompt = MULTITURN_USER_PROMPT.format(passage_text=passage["text"])
+  subset_size = random.randint(min_tools, min(max_tools, len(tool_schemas)))
+  tool_subset = random.sample(tool_schemas, subset_size)
+
+  user_prompt = TOOLS_USER_PROMPT.format(
+    passage_text=passage["text"],
+    tool_schemas_json=json.dumps(tool_subset, indent=2),
+  )
 
   try:
     response_text, model, in_tok, out_tok, cache_read, cache_write = await provider.generate(
@@ -648,7 +674,7 @@ async def process_passage(
     cost.record(model, in_tok, out_tok, cache_read, cache_write)
   except Exception as exc:
     async with write_lock:
-      errors_file.write(json.dumps({"id": pid, "error": f"api: {exc}", "mode": mode}) + "\n")
+      errors_file.write(json.dumps({"id": pid, "error": f"api: {exc}"}) + "\n")
       errors_file.flush()
 
     return 0
@@ -662,7 +688,6 @@ async def process_passage(
           {
             "id": pid,
             "error": f"json_parse: {exc}",
-            "mode": mode,
             "raw": response_text[:500],
           }
         )
@@ -680,7 +705,6 @@ async def process_passage(
           {
             "id": pid,
             "error": "expected JSON array",
-            "mode": mode,
           }
         )
         + "\n"
@@ -690,11 +714,7 @@ async def process_passage(
 
     return 0
 
-  if mode == "tools":
-    examples = process_tools_response(parsed, passage, tool_schemas)
-  else:
-    result = process_multiturn_response(parsed, passage)
-    examples = [result] if result else []
+  examples = process_tools_response(parsed, passage, tool_subset)
 
   count = 0
 
@@ -712,11 +732,12 @@ async def process_passage(
 
 async def run_pipeline(
   passages: list[dict],
-  mode: str,
   provider: LLMProvider,
   concurrency: int,
   output_path: Path,
   errors_path: Path,
+  min_tools: int = 3,
+  max_tools: int = 6,
 ) -> None:
   cost = CostTracker()
   progress = ProgressTracker(output_path)
@@ -724,8 +745,7 @@ async def run_pipeline(
   remaining = [p for p in passages if not progress.is_done(p["id"])]
 
   log.info(
-    "Mode=%s | %d passages total, %d remaining, concurrency=%d",
-    mode,
+    "%d passages total, %d remaining, concurrency=%d",
     len(passages),
     len(remaining),
     concurrency,
@@ -735,12 +755,8 @@ async def run_pipeline(
     log.info("Nothing to do — all passages already processed")
     return
 
-  if mode == "tools":
-    system_prompt = TOOLS_SYSTEM_PROMPT.format(
-      tool_schemas_json=json.dumps(tool_schemas, indent=2),
-    )
-  else:
-    system_prompt = MULTITURN_SYSTEM_PROMPT
+  system_prompt = TOOLS_SYSTEM_PROMPT
+  log.info("Tool subset sampling: %d-%d tools per passage (from %d total)", min_tools, max_tools, len(tool_schemas))
 
   sem = asyncio.Semaphore(concurrency)
   write_lock = asyncio.Lock()
@@ -762,7 +778,6 @@ async def run_pipeline(
       async with sem:
         n = await process_passage(
           passage,
-          mode,
           provider,
           cost,
           progress,
@@ -771,6 +786,8 @@ async def run_pipeline(
           tool_schemas,
           errors_file,
           system_prompt,
+          min_tools,
+          max_tools,
         )
 
         total_examples += n
@@ -803,7 +820,7 @@ async def run_pipeline(
 
   log.info("Running post-generation validation...\n")
 
-  report = validate(output_path, mode)
+  report = validate(output_path)
 
   report.print(file=sys.stderr)
 
@@ -863,11 +880,10 @@ def main():
   _load_dotenv()
 
   parser = argparse.ArgumentParser(
-    description="Generate synthetic training data via LLM APIs",
+    description="Generate synthetic tool-calling training data via LLM APIs",
     formatter_class=argparse.RawDescriptionHelpFormatter,
   )
 
-  parser.add_argument("--mode", required=True, choices=["tools", "multiturn"], help="Generation mode")
   parser.add_argument("--input", required=True, type=Path, help="Input passage JSONL file")
   parser.add_argument("--output", required=True, type=Path, help="Output JSONL file")
   parser.add_argument(
@@ -886,6 +902,24 @@ def main():
   parser.add_argument("--concurrency", type=int, default=10, help="Max concurrent API requests (default: 10)")
   parser.add_argument("--limit", type=int, default=None, help="Max passages to process")
   parser.add_argument("--errors", type=Path, default=None, help="Error log file (default: <output>.errors.jsonl)")
+  parser.add_argument(
+    "--min-tools",
+    type=int,
+    default=3,
+    help="Min tools per passage (default: 3)",
+  )
+  parser.add_argument(
+    "--max-tools",
+    type=int,
+    default=6,
+    help="Max tools per passage (default: 6)",
+  )
+  parser.add_argument(
+    "--oss-backend",
+    default=None,
+    choices=list(OSS_BACKENDS),
+    help="Backend for OSS models: baseten or together (default: auto-detect from env)",
+  )
 
   args = parser.parse_args()
 
@@ -899,19 +933,20 @@ def main():
     log.error("Input file not found: %s", args.input)
     sys.exit(1)
 
-  if args.mode == "tools":
-    if not TOOL_SCHEMAS_PATH.exists():
-      log.error("Tool schemas not found: %s", TOOL_SCHEMAS_PATH)
-      sys.exit(1)
+  if not TOOL_SCHEMAS_PATH.exists():
+    log.error("Tool schemas not found: %s", TOOL_SCHEMAS_PATH)
+    sys.exit(1)
 
-    tool_schemas = _load_tool_schemas()
+  tool_schemas = _load_tool_schemas()
 
-    log.info("Loaded %d tool schemas", len(tool_schemas))
+  log.info("Loaded %d tool schemas", len(tool_schemas))
 
   errors_path = args.errors or args.output.with_suffix(".errors.jsonl")
 
   model, models = _parse_model_args(args.model)
-  provider = make_provider(args.provider, model=model, models=models)
+
+  provider = make_provider(args.provider, model=model, models=models, oss_backend=args.oss_backend)
+
   passages = load_passages(args.input, args.limit)
 
   log.info("Loaded %d passages from %s", len(passages), args.input)
@@ -919,11 +954,12 @@ def main():
   asyncio.run(
     run_pipeline(
       passages=passages,
-      mode=args.mode,
       provider=provider,
       concurrency=args.concurrency,
       output_path=args.output,
       errors_path=errors_path,
+      min_tools=args.min_tools,
+      max_tools=args.max_tools,
     )
   )
 

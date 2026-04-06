@@ -1,4 +1,4 @@
-"""LLM-as-judge for synthetic data quality.
+"""LLM-as-judge for synthetic tool-calling data quality.
 
 Grades every row in a synthetic JSONL file against a multi-dimensional rubric
 using a stronger LLM, then writes a scored copy and a filtered "clean" dataset.
@@ -6,7 +6,6 @@ Uses system-message prompt caching to reduce repeated rubric token costs.
 
 Usage:
   uv run python -m data.scripts.judge_synthetic \
-    --mode tools \
     --input data/synthetic/tools.jsonl \
     --output data/synthetic/tools.judged.jsonl \
     --provider glm \
@@ -27,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from data.scripts.generate_synthetic import (
+  OSS_BACKENDS,
   PROVIDER_CHOICES,
   CostTracker,
   LLMProvider,
@@ -92,85 +92,25 @@ User question:
 Assistant response:
 {response}"""
 
-MULTITURN_JUDGE_SYSTEM_PROMPT = """\
-You are an expert data-quality judge. Score synthetic multi-turn \
-conversations on 5 dimensions using a 1-3 scale.
 
-## Rubric
-
-Routing (Boundary Respect): Does the model correctly refuse when context doesn't cover the question?
-  1 (fail): Answers questions it should refuse, or refuses answerable ones
-  2 (ok): Mostly correct boundaries
-  3 (good): Perfect refusal/answer decisions
-
-Faithfulness: Are all claims supported by the document?
-  1 (fail): Hallucinated facts or unsupported claims
-  2 (ok): Mostly faithful, minor stretch
-  3 (good): Fully grounded with citations
-
-Naturalness: Does the conversation flow naturally?
-  1 (fail): Stilted, robotic, or quiz-like
-  2 (ok): Acceptable but generic
-  3 (good): Natural, flowing conversation
-
-Quality: Are responses complete and well-formatted?
-  1 (fail): Incomplete, malformed, or missing citations
-  2 (ok): Adequate
-  3 (good): Clear, complete, well-formatted
-
-Relevance: Are the questions meaningfully related to the document?
-  1 (fail): Contrived or nonsensical questions
-  2 (ok): Loosely relevant
-  3 (good): Strong topical connection
-
-## Instructions
-
-Score each dimension 1-3. Provide a 1-2 sentence explanation justifying your lowest score.
-
-Respond with ONLY a JSON object (no other text):
-{{"routing": N, "faithfulness": N, "naturalness": N, "quality": N, "relevance": N, "explanation": "..."}}"""
-
-MULTITURN_JUDGE_USER_PROMPT = """\
-Context passage:
-{context}
-
-Conversation:
-{conversation}"""
-
-
-def get_judge_system_prompt(mode: str) -> str:
-  if mode == "tools":
-    return TOOLS_JUDGE_SYSTEM_PROMPT
-  return MULTITURN_JUDGE_SYSTEM_PROMPT
-
-
-def build_judge_user_prompt(row: dict, mode: str) -> str:
+def build_judge_user_prompt(row: dict) -> str:
   context = row.get("context", "")
   conversation = row.get("conversation", [])
+  tools_json = json.dumps(row.get("tools", []), indent=2)
+  question = ""
+  response = ""
 
-  if mode == "tools":
-    tools_json = json.dumps(row.get("tools", []), indent=2)
-    question = ""
-    response = ""
+  for turn in conversation:
+    if turn["role"] == "user":
+      question = turn["content"]
+    elif turn["role"] == "assistant":
+      response = turn["content"]
 
-    for turn in conversation:
-      if turn["role"] == "user":
-        question = turn["content"]
-      elif turn["role"] == "assistant":
-        response = turn["content"]
-
-    return TOOLS_JUDGE_USER_PROMPT.format(
-      context=context,
-      tools=tools_json,
-      question=question,
-      response=response,
-    )
-
-  conv_text = "\n".join(f"{turn['role'].upper()}: {turn['content']}" for turn in conversation)
-
-  return MULTITURN_JUDGE_USER_PROMPT.format(
+  return TOOLS_JUDGE_USER_PROMPT.format(
     context=context,
-    conversation=conv_text,
+    tools=tools_json,
+    question=question,
+    response=response,
   )
 
 
@@ -199,7 +139,6 @@ def passes_threshold(scores: dict[str, Any], threshold: float) -> bool:
 async def judge_row(
   line_idx: int,
   row: dict,
-  mode: str,
   provider: LLMProvider,
   cost: CostTracker,
   progress: ProgressTracker,
@@ -215,7 +154,7 @@ async def judge_row(
   if progress.is_done(row_id):
     return {"judged": False, "passed": None}
 
-  user_prompt = build_judge_user_prompt(row, mode)
+  user_prompt = build_judge_user_prompt(row)
 
   try:
     response_text, model, in_tok, out_tok, cache_read, cache_write = await provider.generate(
@@ -293,7 +232,6 @@ def print_summary(
 
 async def run_judge(
   rows: list[dict],
-  mode: str,
   provider: LLMProvider,
   concurrency: int,
   output_path: Path,
@@ -308,8 +246,7 @@ async def run_judge(
   remaining_indices = [i for i in range(len(rows)) if not progress.is_done(str(i))]
 
   log.info(
-    "Mode=%s | %d rows total, %d remaining, concurrency=%d, threshold=%.2f",
-    mode,
+    "%d rows total, %d remaining, concurrency=%d, threshold=%.2f",
     len(rows),
     len(remaining_indices),
     concurrency,
@@ -320,7 +257,7 @@ async def run_judge(
     log.info("Nothing to do — all rows already judged")
     return
 
-  system_prompt = get_judge_system_prompt(mode)
+  system_prompt = TOOLS_JUDGE_SYSTEM_PROMPT
   sem = asyncio.Semaphore(concurrency)
   write_lock = asyncio.Lock()
 
@@ -345,7 +282,6 @@ async def run_judge(
         result = await judge_row(
           idx,
           rows[idx],
-          mode,
           provider,
           cost,
           progress,
@@ -457,7 +393,6 @@ def main():
     formatter_class=argparse.RawDescriptionHelpFormatter,
   )
 
-  parser.add_argument("--mode", required=True, choices=["tools", "multiturn"], help="Data mode to judge")
   parser.add_argument("--input", required=True, type=Path, help="Input synthetic JSONL file")
   parser.add_argument("--output", required=True, type=Path, help="Output judged JSONL file")
   parser.add_argument(
@@ -475,6 +410,12 @@ def main():
   parser.add_argument("--concurrency", type=int, default=10, help="Max concurrent API requests (default: 10)")
   parser.add_argument("--threshold", type=float, default=2.4, help="Pass threshold for average score (default: 2.4)")
   parser.add_argument("--limit", type=int, default=None, help="Max rows to judge (for spot-checking)")
+  parser.add_argument(
+    "--oss-backend",
+    default=None,
+    choices=list(OSS_BACKENDS),
+    help="Backend for OSS models: baseten or together (default: auto-detect from env)",
+  )
 
   args = parser.parse_args()
 
@@ -493,7 +434,8 @@ def main():
   if args.provider != "round-robin" and model is None:
     model = "glm-5"
 
-  provider = make_provider(args.provider, model=model, models=models)
+  provider = make_provider(args.provider, model=model, models=models, oss_backend=args.oss_backend)
+
   rows = load_rows(args.input, args.limit)
 
   log.info("Loaded %d rows from %s", len(rows), args.input)
@@ -501,7 +443,6 @@ def main():
   asyncio.run(
     run_judge(
       rows=rows,
-      mode=args.mode,
       provider=provider,
       concurrency=args.concurrency,
       output_path=args.output,
