@@ -1,29 +1,28 @@
-"""Generate near-miss refusal training data by cross-pairing within same-domain contexts.
+"""Generate near-miss and random-adversarial refusal training data.
 
 This does not require any LLM calls, it's just intelligent cross-pairing, so it's free and fast.
 
-Unlike off-topic refusals (random unrelated pairs), near-miss refusals pair a question
-with a context that is topically similar but does NOT contain the answer. This teaches
-the model the harder skill. Even if the context looks relevant, refuse if the specific
-answer isn't there.
+Two modes:
 
-Strategy:
-  1. Load answerable QA examples from open datasets (SQuAD2, DROP)
-  2. Group contexts by keyword similarity (shingled MinHash buckets)
-  3. Within each bucket, cross-pair questions with different contexts
-  4. Verify the answer text is NOT in the new context
-  5. Prefer high keyword overlap pairs (harder negatives)
+  Near-miss (default): Pairs a question with a context that is topically similar
+  but does NOT contain the answer. This teaches the harder skill: "even if the
+  context looks relevant, refuse if the specific answer isn't there."
+
+  Random-adversarial (--random-adversarial): Pairs any question with any different
+  context, mirroring the eval hallucination probe exactly. No overlap filtering,
+  just answer-absence verification.
 
 Usage:
+  # Near-miss (same-domain hard negatives)
   uv run python -m data.scripts.generate_nearmiss_refusal \
     --output data/synthetic/nearmiss_refusal.jsonl \
     --limit 30000
 
+  # Random adversarial (matches hallucination probe pattern)
   uv run python -m data.scripts.generate_nearmiss_refusal \
-    --output data/synthetic/nearmiss_refusal.jsonl \
+    --output data/synthetic/random_adversarial_refusal.jsonl \
     --limit 30000 \
-    --seed 42 \
-    --min-overlap 0.15
+    --random-adversarial
 """
 
 from __future__ import annotations
@@ -34,7 +33,6 @@ import logging
 import random
 import sys
 import time
-from collections import defaultdict
 from pathlib import Path
 
 import nltk
@@ -162,7 +160,7 @@ def compute_overlap(words_a: set[str], words_b: set[str]) -> float:
   return intersection / smaller
 
 
-def generate_examples(
+def generate_nearmiss_examples(
   qa_examples: list[dict],
   target_count: int,
   seed: int = 42,
@@ -172,19 +170,7 @@ def generate_examples(
   """Generate near-miss refusal examples by finding similar-but-wrong context pairs."""
   rng = random.Random(seed)
 
-  ctx_to_indices: dict[str, list[int]] = defaultdict(list)
-
-  for i, ex in enumerate(qa_examples):
-    ctx_to_indices[ex["context"]].append(i)
-
-  unique_contexts = list(ctx_to_indices.keys())
-
-  log.info("  %d unique contexts from %d examples", len(unique_contexts), len(qa_examples))
-
-  context_words_cache: dict[int, set[str]] = {}
-
-  for i, ctx in enumerate(unique_contexts):
-    context_words_cache[i] = _content_words(ctx)
+  log.info("  %d examples available", len(qa_examples))
 
   examples: list[dict] = []
   attempts = 0
@@ -246,9 +232,61 @@ def generate_examples(
   return examples
 
 
+def generate_random_adversarial_examples(
+  qa_examples: list[dict],
+  target_count: int,
+  seed: int = 42,
+) -> list[dict]:
+  """Generate random adversarial refusal examples — any question with any different context.
+
+  Mirrors the eval hallucination probe: no overlap filtering, just verifies
+  the answer isn't in the paired context.
+  """
+  rng = random.Random(seed)
+
+  log.info("  %d examples available", len(qa_examples))
+
+  examples: list[dict] = []
+  refusal_idx = 0
+  indices = list(range(len(qa_examples)))
+
+  for _ in range(target_count):
+    for _attempt in range(10):
+      i, j = rng.sample(indices, 2)
+      q_ex = qa_examples[i]
+      c_ex = qa_examples[j]
+
+      if q_ex["context"] == c_ex["context"]:
+        continue
+
+      if _answer_in_context(q_ex["answer_text"], c_ex["context"]):
+        continue
+
+      response = REFUSAL_RESPONSES[refusal_idx % len(REFUSAL_RESPONSES)]
+      refusal_idx += 1
+
+      examples.append(
+        {
+          "context": c_ex["context"],
+          "conversation": [
+            {"role": "user", "content": q_ex["question"]},
+            {"role": "assistant", "content": response},
+          ],
+          "source": "synthetic-random-adversarial-refusal",
+        }
+      )
+      break
+
+  rng.shuffle(examples)
+
+  log.info("Generated %d random adversarial refusal examples", len(examples))
+
+  return examples
+
+
 def main():
   parser = argparse.ArgumentParser(
-    description="Generate near-miss refusal training data (no LLM calls)",
+    description="Generate near-miss or random-adversarial refusal training data (no LLM calls)",
     formatter_class=argparse.RawDescriptionHelpFormatter,
   )
 
@@ -256,16 +294,22 @@ def main():
   parser.add_argument("--limit", type=int, default=30000, help="Number of examples to generate (default: 30000)")
   parser.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
   parser.add_argument(
+    "--random-adversarial",
+    action="store_true",
+    help="Generate random cross-pairs (any question + any different context) instead of near-miss. "
+    "Mirrors the eval hallucination probe pattern exactly.",
+  )
+  parser.add_argument(
     "--min-overlap",
     type=float,
     default=0.15,
-    help="Minimum keyword overlap between question-context and paired context (default: 0.15)",
+    help="Minimum keyword overlap for near-miss mode (default: 0.15, ignored with --random-adversarial)",
   )
   parser.add_argument(
     "--max-overlap",
     type=float,
     default=0.85,
-    help="Maximum keyword overlap to avoid near-duplicates (default: 0.85)",
+    help="Maximum keyword overlap for near-miss mode (default: 0.85, ignored with --random-adversarial)",
   )
 
   args = parser.parse_args()
@@ -288,20 +332,27 @@ def main():
     log.error("Too few examples — need open datasets converted first")
     sys.exit(1)
 
-  log.info(
-    "Generating %d near-miss refusal examples (overlap %.2f-%.2f)...",
-    args.limit,
-    args.min_overlap,
-    args.max_overlap,
-  )
-
-  examples = generate_examples(
-    qa_examples,
-    target_count=args.limit,
-    seed=args.seed,
-    min_overlap=args.min_overlap,
-    max_overlap=args.max_overlap,
-  )
+  if args.random_adversarial:
+    log.info("Generating %d random adversarial refusal examples...", args.limit)
+    examples = generate_random_adversarial_examples(
+      qa_examples,
+      target_count=args.limit,
+      seed=args.seed,
+    )
+  else:
+    log.info(
+      "Generating %d near-miss refusal examples (overlap %.2f-%.2f)...",
+      args.limit,
+      args.min_overlap,
+      args.max_overlap,
+    )
+    examples = generate_nearmiss_examples(
+      qa_examples,
+      target_count=args.limit,
+      seed=args.seed,
+      min_overlap=args.min_overlap,
+      max_overlap=args.max_overlap,
+    )
 
   args.output.parent.mkdir(parents=True, exist_ok=True)
 

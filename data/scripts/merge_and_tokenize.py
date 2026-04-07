@@ -52,6 +52,7 @@ ALL_SOURCES = {
   "drop": DATA_DIR / "open_datasets" / "drop.jsonl",
   "synthetic-offtopic-refusal": DATA_DIR / "synthetic" / "offtopic_refusal.jsonl",
   "synthetic-nearmiss-refusal": DATA_DIR / "synthetic" / "nearmiss_refusal.jsonl",
+  "synthetic-random-adversarial-refusal": DATA_DIR / "synthetic" / "random_adversarial_refusal.jsonl",
 }
 
 FILTERED_PATH = PROCESSED_DIR / "filtered.jsonl"
