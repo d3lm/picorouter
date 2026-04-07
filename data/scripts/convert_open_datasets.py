@@ -38,7 +38,7 @@ COQA_URLS = {
 
 DROP_URL = "https://ai2-public-datasets.s3.amazonaws.com/drop/drop_dataset.zip"
 
-REFUSAL_TEXT = "<|refuse|>I don't have enough information in the provided context to answer that question."
+REFUSAL_TEXT = "<|refuse|>"
 
 GROUNDING_PREFIXES = [
   "Based on the context, ",

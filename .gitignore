@@ -17,6 +17,7 @@ browser/public/tokenizer.json
 .tsbuildinfo
 
 model/checkpoints/
+model/runs/
 model/exports/
 training_log.jsonl
 

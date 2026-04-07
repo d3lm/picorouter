@@ -55,15 +55,7 @@ nltk.download("stopwords", quiet=True)
 
 STOP_WORDS = frozenset(stopwords.words("english"))
 
-REFUSAL_PHRASE = "I don't have enough information in the provided context"
-
-REFUSAL_RESPONSES = [
-  f"<|refuse|>{REFUSAL_PHRASE} to answer that question.",
-  f"<|refuse|>{REFUSAL_PHRASE} to answer that.",
-  f"<|refuse|>{REFUSAL_PHRASE} to answer this question accurately.",
-  f"<|refuse|>{REFUSAL_PHRASE}. The question is about a topic not covered here.",
-  f"<|refuse|>{REFUSAL_PHRASE} to provide an answer to that question.",
-]
+REFUSAL_RESPONSE = "<|refuse|>"
 
 
 def _content_words(text: str) -> set[str]:
@@ -78,7 +70,7 @@ def _extract_answer_text(assistant_content: str) -> str | None:
   if not assistant_content or "<|refuse|>" in assistant_content:
     return None
 
-  if REFUSAL_PHRASE.lower() in assistant_content.lower():
+  if "<|refuse|>" in assistant_content:
     return None
 
   return assistant_content
@@ -175,7 +167,6 @@ def generate_nearmiss_examples(
   examples: list[dict] = []
   attempts = 0
   max_attempts = target_count * 20
-  refusal_idx = 0
 
   indices = list(range(len(qa_examples)))
 
@@ -199,15 +190,12 @@ def generate_nearmiss_examples(
     if _answer_in_context(q_ex["answer_text"], c_ex["context"]):
       continue
 
-    response = REFUSAL_RESPONSES[refusal_idx % len(REFUSAL_RESPONSES)]
-    refusal_idx += 1
-
     examples.append(
       {
         "context": c_ex["context"],
         "conversation": [
           {"role": "user", "content": q_ex["question"]},
-          {"role": "assistant", "content": response},
+          {"role": "assistant", "content": REFUSAL_RESPONSE},
         ],
         "source": "synthetic-nearmiss-refusal",
       }
@@ -247,7 +235,6 @@ def generate_random_adversarial_examples(
   log.info("  %d examples available", len(qa_examples))
 
   examples: list[dict] = []
-  refusal_idx = 0
   indices = list(range(len(qa_examples)))
 
   for _ in range(target_count):
@@ -262,15 +249,12 @@ def generate_random_adversarial_examples(
       if _answer_in_context(q_ex["answer_text"], c_ex["context"]):
         continue
 
-      response = REFUSAL_RESPONSES[refusal_idx % len(REFUSAL_RESPONSES)]
-      refusal_idx += 1
-
       examples.append(
         {
           "context": c_ex["context"],
           "conversation": [
             {"role": "user", "content": q_ex["question"]},
-            {"role": "assistant", "content": response},
+            {"role": "assistant", "content": REFUSAL_RESPONSE},
           ],
           "source": "synthetic-random-adversarial-refusal",
         }

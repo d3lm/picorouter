@@ -27,7 +27,6 @@ FILTERED_PATH = DATA_DIR / "filtered.jsonl"
 EVAL_REPORT_PATH = Path(__file__).parent / "eval_report.json"
 CACHED_TEST_PATH = DATA_DIR / "cached_test_split.json"
 
-REFUSAL_PHRASE = "I don't have enough information"
 DEFAULT_BATCH_SIZE = 32
 
 
@@ -273,9 +272,7 @@ def load_test_examples() -> dict[str, list[dict]]:
   groups: dict[str, list[dict]] = {"rc": [], "refusal": []}
 
   for example in test_set:
-    is_refusal = any(
-      REFUSAL_PHRASE in turn["content"] for turn in example["conversation"] if turn["role"] == "assistant"
-    )
+    is_refusal = any("<|refuse|>" in turn["content"] for turn in example["conversation"] if turn["role"] == "assistant")
 
     if is_refusal:
       groups["refusal"].append(example)
@@ -405,7 +402,6 @@ def eval_refusal(
   batch_size: int = DEFAULT_BATCH_SIZE,
   *,
   rc_gen_ids: list[list[int]],
-  rc_predictions: list[str],
 ) -> dict:
   eos_id = tokenizer.token_to_id("<|eos|>")
   refuse_id = tokenizer.token_to_id("<|refuse|>")
@@ -418,15 +414,13 @@ def eval_refusal(
   correct_refusals = 0
 
   for gen_ids in all_gen_ids:
-    prediction = tokenizer.decode(gen_ids)
-
-    if REFUSAL_PHRASE.lower() in prediction.lower() or refuse_id in gen_ids:
+    if refuse_id in gen_ids:
       correct_refusals += 1
 
   false_refusals = 0
 
-  for gen_ids, prediction in zip(rc_gen_ids, rc_predictions, strict=True):
-    if REFUSAL_PHRASE.lower() in prediction.lower() or refuse_id in gen_ids:
+  for gen_ids in rc_gen_ids:
+    if refuse_id in gen_ids:
       false_refusals += 1
 
   n_ref = len(refusal_subset)
@@ -454,7 +448,7 @@ def build_adversarial_examples(
   pool = [
     example
     for example in examples
-    if not any(REFUSAL_PHRASE in t["content"] for t in example["conversation"] if t["role"] == "assistant")
+    if not any("<|refuse|>" in t["content"] for t in example["conversation"] if t["role"] == "assistant")
   ]
 
   if len(pool) < 2:
@@ -499,8 +493,7 @@ def eval_hallucination(
   hallucinations = 0
 
   for gen_ids in all_gen_ids:
-    prediction = tokenizer.decode(gen_ids)
-    is_refusal = REFUSAL_PHRASE.lower() in prediction.lower() or refuse_id in gen_ids
+    is_refusal = refuse_id in gen_ids
 
     if not is_refusal:
       hallucinations += 1
@@ -659,7 +652,6 @@ def run_evaluation(
 
   rc_fp_prompts = [build_prompt_tokens(tokenizer, ex) for ex in rc_fp_subset]
   rc_fp_gen_ids = generate_batch(model, rc_fp_prompts, eos_id, device, batch_size=batch_size, desc="[0/4] RC FP")
-  rc_fp_predictions = [tokenizer.decode(ids) for ids in rc_fp_gen_ids]
 
   print("       done")
 
@@ -679,7 +671,6 @@ def run_evaluation(
     max_refusal,
     batch_size,
     rc_gen_ids=rc_fp_gen_ids,
-    rc_predictions=rc_fp_predictions,
   )
 
   ref = report["refusal"]

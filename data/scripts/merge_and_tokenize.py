@@ -33,8 +33,6 @@ PROCESSED_DIR = DATA_DIR / "processed"
 MODEL_DIR = ROOT / "model"
 TOKENIZER_PATH = MODEL_DIR / "tokenizer.json"
 
-REFUSAL_PHRASE = "I don't have enough information in the provided context"
-
 _CITATION_RE = re.compile(r"\s*\[source:[^\]]*\]\.?")
 
 SPECIAL_TOKENS = [
@@ -184,8 +182,8 @@ def _check_row(row: dict) -> list[str]:
       errors.append("empty assistant content")
       continue
 
-    if content.startswith("<|refuse|>") and REFUSAL_PHRASE.lower() not in content.lower():
-      errors.append("refusal missing standard phrase")
+    if content.startswith("<|refuse|>") and content != "<|refuse|>":
+      errors.append("refusal should be exactly '<|refuse|>' with no trailing text")
 
   return errors
 

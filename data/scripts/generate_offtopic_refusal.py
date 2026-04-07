@@ -54,15 +54,7 @@ nltk.download("stopwords", quiet=True)
 
 STOP_WORDS = frozenset(stopwords.words("english"))
 
-REFUSAL_PHRASE = "I don't have enough information in the provided context"
-
-REFUSAL_RESPONSES = [
-  f"<|refuse|>{REFUSAL_PHRASE} to answer that question.",
-  f"<|refuse|>{REFUSAL_PHRASE} to answer that.",
-  f"<|refuse|>{REFUSAL_PHRASE} to answer this question accurately.",
-  f"<|refuse|>{REFUSAL_PHRASE}. The question is about a topic not covered here.",
-  f"<|refuse|>{REFUSAL_PHRASE} to provide an answer to that question.",
-]
+REFUSAL_RESPONSE = "<|refuse|>"
 
 GENERIC_QUESTIONS = [
   # Technology
@@ -180,9 +172,7 @@ def load_questions(paths: list[Path]) -> list[str]:
         conversation = row.get("conversation", [])
 
         is_refusal = any(
-          REFUSAL_PHRASE.lower() in turn.get("content", "").lower()
-          for turn in conversation
-          if turn.get("role") == "assistant"
+          "<|refuse|>" in turn.get("content", "") for turn in conversation if turn.get("role") == "assistant"
         )
 
         if is_refusal:
@@ -227,7 +217,6 @@ def generate_examples(
   rng = random.Random(seed)
 
   all_questions = questions + GENERIC_QUESTIONS
-  n_responses = len(REFUSAL_RESPONSES)
   examples: list[dict] = []
   skipped = 0
   max_retries = 5
@@ -246,7 +235,7 @@ def generate_examples(
     else:
       question = rng.choice(GENERIC_QUESTIONS)
 
-    response = REFUSAL_RESPONSES[i % n_responses]
+    response = REFUSAL_RESPONSE
 
     examples.append(
       {
