@@ -216,6 +216,7 @@ def train(
   print("=" * 70)
 
   global_step = 0
+  best_val_loss = None
   start_time = time.time()
 
   model.train()
@@ -271,8 +272,15 @@ def train(
 
         if global_step % val_every == 0:
           val_loss = compute_val_loss(model, val_ids, val_mask, batch_size, device, use_amp=use_amp)
+
           model.train()
+
           print(f"  >>> val_loss={val_loss:.4f} (step {global_step})")
+
+          if best_val_loss is None or val_loss < best_val_loss:
+            best_val_loss = val_loss
+            save_checkpoint(raw_model, config, global_step, tag="best")
+            print("  >>> new best val_loss — checkpoint saved")
         else:
           val_loss = None
 
